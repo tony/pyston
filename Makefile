@@ -1,5 +1,3 @@
-SHELL := /bin/bash
-
 # prints variables for debugging
 print-%: ; @echo $($*)
 
@@ -159,7 +157,7 @@ ifneq ($(wildcard /usr/local/include/llvm),)
 # those files.
 # This could probably be handled (somehow blacklist this particular folder?),
 # but for now just error out:
-$(error "Error: global llvm include files detected")
+#$(error "Error: global llvm include files detected")
 endif
 
 # Note: use lazy-expansion for these profile targets, since calling the profile llvm-config will
