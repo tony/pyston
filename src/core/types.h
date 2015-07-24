@@ -95,6 +95,7 @@ class AST;
 class AST_FunctionDef;
 class AST_arguments;
 class AST_expr;
+class AST_Name;
 class AST_stmt;
 
 class PhiAnalysis;
@@ -132,6 +133,11 @@ struct ArgPassSpec {
 
     int totalPassed() { return num_args + num_keywords + (has_starargs ? 1 : 0) + (has_kwargs ? 1 : 0); }
 
+    int kwargsIndex() const {
+        assert(has_kwargs);
+        return num_args + num_keywords + (has_starargs ? 1 : 0);
+    }
+
     uint32_t asInt() const { return *reinterpret_cast<const uint32_t*>(this); }
 
     void dump() {
@@ -147,6 +153,12 @@ struct ParamNames {
     std::vector<llvm::StringRef> args;
     llvm::StringRef vararg, kwarg;
 
+    // This members are only set if the InternedStringPool& constructor is used (aka. source is available)!
+    // They are used as an optimization while interpreting because the AST_Names nodes cache important stuff
+    // (InternedString, lookup_type) which would otherwise have to get recomputed all the time.
+    std::vector<AST_Name*> arg_names;
+    AST_Name* vararg_name, *kwarg_name;
+
     explicit ParamNames(AST* ast, InternedStringPool& pool);
     ParamNames(const std::vector<llvm::StringRef>& args, llvm::StringRef vararg, llvm::StringRef kwarg);
     static ParamNames empty() { return ParamNames(); }
@@ -155,8 +167,13 @@ struct ParamNames {
         return args.size() + (vararg.str().size() == 0 ? 0 : 1) + (kwarg.str().size() == 0 ? 0 : 1);
     }
 
+    int kwargsIndex() const {
+        assert(kwarg.str().size());
+        return args.size() + (vararg.str().size() == 0 ? 0 : 1);
+    }
+
 private:
-    ParamNames() : takes_param_names(false) {}
+    ParamNames() : takes_param_names(false), vararg_name(NULL), kwarg_name(NULL) {}
 };
 
 // Probably overkill to copy this from ArgPassSpec
@@ -347,8 +364,9 @@ public:
         compiled->clfunc = this;
 
         if (compiled->entry_descriptor == NULL) {
-            if (versions.size() == 0 && compiled->effort == EffortLevel::MAXIMAL && compiled->spec->accepts_all_inputs
-                && compiled->spec->boxed_return_value)
+            bool could_have_speculations = (source.get() != NULL);
+            if (!could_have_speculations && versions.size() == 0 && compiled->effort == EffortLevel::MAXIMAL
+                && compiled->spec->accepts_all_inputs && compiled->spec->boxed_return_value)
                 always_use_version = compiled;
 
             assert(compiled->spec->arg_types.size() == paramspec.totalReceived());
@@ -455,6 +473,26 @@ struct SetattrRewriteArgs;
 struct GetattrRewriteArgs;
 struct DelattrRewriteArgs;
 
+// Helper function around PyString_InternFromString:
+BoxedString* internStringImmortal(llvm::StringRef s);
+
+// Callers should use this function if they can accept mortal string objects.
+// FIXME For now it just returns immortal strings, but at least we can use it
+// to start documenting the places that can take mortal strings.
+inline BoxedString* internStringMortal(const char* s) {
+    return internStringImmortal(s);
+}
+
+inline BoxedString* internStringMortal(llvm::StringRef s) {
+    assert(s.data()[s.size()] == '\0');
+    return internStringMortal(s.data());
+}
+
+// TODO this is an immortal intern for now
+inline void internStringMortalInplace(BoxedString*& s) {
+    PyString_InternInPlace((PyObject**)&s);
+}
+
 struct HCAttrs {
 public:
     struct AttrList {
@@ -470,6 +508,12 @@ public:
 class BoxedDict;
 class BoxedString;
 
+// In Pyston, this is the same type as CPython's PyObject (they are interchangeable, but we
+// use Box in Pyston wherever possible as a convention).
+//
+// Other types on Pyston inherit from Box (e.g. BoxedString is a Box). Why is this class not
+// polymorphic? Because of C extension support -- having virtual methods would change the layout
+// of the object.
 class Box {
 private:
     BoxedDict** getDictPtr();
@@ -495,18 +539,19 @@ public:
     BoxedDict* getDict();
 
 
-    void setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_args);
-    void giveAttr(llvm::StringRef attr, Box* val) {
+    void setattr(BoxedString* attr, Box* val, SetattrRewriteArgs* rewrite_args);
+    void giveAttr(const char* attr, Box* val) { giveAttr(internStringMortal(attr), val); }
+    void giveAttr(BoxedString* attr, Box* val) {
         assert(!this->hasattr(attr));
         this->setattr(attr, val, NULL);
     }
 
     // getattr() does the equivalent of PyDict_GetItem(obj->dict, attr): it looks up the attribute's value on the
     // object's attribute storage. it doesn't look at other objects or do any descriptor logic.
-    Box* getattr(llvm::StringRef attr, GetattrRewriteArgs* rewrite_args);
-    Box* getattr(llvm::StringRef attr) { return getattr(attr, NULL); }
-    bool hasattr(llvm::StringRef attr) { return getattr(attr) != NULL; }
-    void delattr(llvm::StringRef attr, DelattrRewriteArgs* rewrite_args);
+    Box* getattr(BoxedString* attr, GetattrRewriteArgs* rewrite_args);
+    Box* getattr(BoxedString* attr) { return getattr(attr, NULL); }
+    bool hasattr(BoxedString* attr) { return getattr(attr) != NULL; }
+    void delattr(BoxedString* attr, DelattrRewriteArgs* rewrite_args);
 
     // Only valid for hc-backed instances:
     Box* getAttrWrapper();
@@ -584,6 +629,10 @@ extern "C" PyObject* PystonType_GenericAlloc(BoxedClass* cls, Py_ssize_t nitems)
         assert(default_cls->tp_basicsize == size);                                                                     \
         assert(default_cls->is_pyston_class);                                                                          \
         assert(default_cls->attrs_offset == 0);                                                                        \
+                                                                                                                       \
+        /* Don't allocate classes through this -- we need to keep track of all class objects. */                       \
+        assert(default_cls != type_cls);                                                                               \
+        assert(!gc::hasOrderedFinalizer(default_cls));                                                                 \
                                                                                                                        \
         /* note: we want to use size instead of tp_basicsize, since size is a compile-time constant */                 \
         void* mem = gc_alloc(size, gc::GCKind::PYTHON);                                                                \

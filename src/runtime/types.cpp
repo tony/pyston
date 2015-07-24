@@ -87,12 +87,11 @@ extern "C" void initstrop();
 
 namespace pyston {
 
-static const std::string init_str("__init__");
-static const std::string new_str("__new__");
-
 void setupGC();
 
 bool IN_SHUTDOWN = false;
+
+std::vector<BoxedClass*> exception_types;
 
 void FrameInfo::gcVisit(GCVisitor* visitor) {
     visitor->visit(boxedLocals);
@@ -230,7 +229,7 @@ Box* BoxedClass::callHasnextIC(Box* obj, bool null_on_nonexistent) {
         hasnext_ic.reset(ic);
     }
 
-    static BoxedString* hasnext_str = static_cast<BoxedString*>(PyString_InternFromString("__hasnext__"));
+    static BoxedString* hasnext_str = internStringImmortal("__hasnext__");
     CallattrFlags callattr_flags
         = {.cls_only = true, .null_on_nonexistent = null_on_nonexistent, .argspec = ArgPassSpec(0) };
     return ic->call(obj, hasnext_str, callattr_flags, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -274,7 +273,7 @@ Box* BoxedClass::callNextIC(Box* obj) {
         next_ic.reset(ic);
     }
 
-    static BoxedString* next_str = static_cast<BoxedString*>(PyString_InternFromString("next"));
+    static BoxedString* next_str = internStringImmortal("next");
     CallattrFlags callattr_flags{.cls_only = true, .null_on_nonexistent = false, .argspec = ArgPassSpec(0) };
     return ic->call(obj, next_str, callattr_flags, nullptr, nullptr, nullptr, nullptr, nullptr);
 }
@@ -288,7 +287,7 @@ Box* BoxedClass::callReprIC(Box* obj) {
         repr_ic.reset(ic);
     }
 
-    static BoxedString* repr_str = static_cast<BoxedString*>(PyString_InternFromString("__repr__"));
+    static BoxedString* repr_str = internStringImmortal("__repr__");
     CallattrFlags callattr_flags{.cls_only = true, .null_on_nonexistent = false, .argspec = ArgPassSpec(0) };
     return ic->call(obj, repr_str, callattr_flags, nullptr, nullptr, nullptr, nullptr, nullptr);
 }
@@ -330,12 +329,14 @@ Box* Box::hasnextOrNullIC() {
     return this->cls->callHasnextIC(this, true);
 }
 
-std::string builtinStr("__builtin__");
-
 extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f)
     : in_weakreflist(NULL), f(f), closure(NULL), ndefaults(0), defaults(NULL), modname(NULL), name(NULL), doc(NULL) {
     if (f->source) {
-        this->modname = PyDict_GetItemString(getGlobalsDict(), "__name__");
+        assert(f->source->scoping->areGlobalsFromModule());
+        Box* globals_for_name = f->source->parent_module;
+
+        static BoxedString* name_str = internStringImmortal("__name__");
+        this->modname = globals_for_name->getattr(name_str);
         this->doc = f->source->getDocString();
     } else {
         this->modname = PyString_InternFromString("__builtin__");
@@ -346,8 +347,18 @@ extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f)
 }
 
 extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f, std::initializer_list<Box*> defaults,
-                                                BoxedClosure* closure)
-    : in_weakreflist(NULL), f(f), closure(closure), ndefaults(0), defaults(NULL), modname(NULL), name(NULL), doc(NULL) {
+                                                BoxedClosure* closure, Box* globals)
+    : in_weakreflist(NULL),
+      f(f),
+      closure(closure),
+      globals(globals),
+      ndefaults(0),
+      defaults(NULL),
+      modname(NULL),
+      name(NULL),
+      doc(NULL) {
+    assert((!globals) == (!f->source || f->source->scoping->areGlobalsFromModule()));
+
     if (defaults.size()) {
         // make sure to initialize defaults first, since the GC behavior is triggered by ndefaults,
         // and a GC can happen within this constructor:
@@ -357,7 +368,20 @@ extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f, std::initializer_
     }
 
     if (f->source) {
-        this->modname = PyDict_GetItemString(getGlobalsDict(), "__name__");
+        Box* globals_for_name = globals;
+        if (!globals_for_name) {
+            assert(f->source->scoping->areGlobalsFromModule());
+            globals_for_name = f->source->parent_module;
+        }
+
+        static BoxedString* name_str = internStringImmortal("__name__");
+        if (globals_for_name->cls == module_cls) {
+            this->modname = globals_for_name->getattr(name_str);
+        } else {
+            this->modname = PyDict_GetItem(globals_for_name, name_str);
+        }
+        // It's ok for modname to be NULL
+
         this->doc = f->source->getDocString();
     } else {
         this->modname = PyString_InternFromString("__builtin__");
@@ -371,10 +395,7 @@ BoxedFunction::BoxedFunction(CLFunction* f) : BoxedFunction(f, {}) {
 }
 
 BoxedFunction::BoxedFunction(CLFunction* f, std::initializer_list<Box*> defaults, BoxedClosure* closure, Box* globals)
-    : BoxedFunctionBase(f, defaults, closure) {
-
-    assert((!globals) == (!f->source || f->source->scoping->areGlobalsFromModule()));
-    this->globals = globals;
+    : BoxedFunctionBase(f, defaults, closure, globals) {
 
     // TODO eventually we want this to assert(f->source), I think, but there are still
     // some builtin functions that are BoxedFunctions but really ought to be a type that
@@ -441,7 +462,8 @@ static void functionDtor(Box* b) {
 }
 
 std::string BoxedModule::name() {
-    Box* name = this->getattr("__name__");
+    static BoxedString* name_str = internStringImmortal("__name__");
+    Box* name = this->getattr(name_str);
     if (!name || name->cls != str_cls) {
         return "?";
     } else {
@@ -450,9 +472,21 @@ std::string BoxedModule::name() {
     }
 }
 
-BoxedString* BoxedModule::getStringConstant(llvm::StringRef ast_str) {
+BoxedString* BoxedModule::getStringConstant(llvm::StringRef ast_str, bool intern) {
     BoxedString*& r = str_constants[ast_str];
-    if (!r)
+    if (intern) {
+        // If we had previously created a box for this string, we have to create a new
+        // string (or at least, be prepared to return a different value that we had already
+        // interned).  This is fine, except we have to be careful because we promised
+        // that we would keep the previously-created string alive.
+        // So, make sure to put it onto the keep_alive list.
+        if (r && !PyString_CHECK_INTERNED(r)) {
+            keep_alive.push_back(r);
+            r = NULL;
+        }
+        if (!r)
+            r = internStringMortal(ast_str);
+    } else if (!r)
         r = boxString(ast_str);
     return r;
 }
@@ -471,15 +505,22 @@ BoxedInt* BoxedModule::getIntConstant(int64_t n) {
     return r;
 }
 
+static int64_t getDoubleBits(double d) {
+    int64_t rtn;
+    static_assert(sizeof(rtn) == sizeof(d), "");
+    memcpy(&rtn, &d, sizeof(d));
+    return rtn;
+}
+
 BoxedFloat* BoxedModule::getFloatConstant(double d) {
-    BoxedFloat*& r = float_constants[d];
+    BoxedFloat*& r = float_constants[getDoubleBits(d)];
     if (!r)
         r = static_cast<BoxedFloat*>(boxFloat(d));
     return r;
 }
 
 Box* BoxedModule::getPureImaginaryConstant(double d) {
-    Box*& r = imaginary_constants[d];
+    Box*& r = imaginary_constants[getDoubleBits(d)];
     if (!r)
         r = createPureImaginary(d);
     return r;
@@ -507,13 +548,14 @@ void BoxedModule::gcHandler(GCVisitor* v, Box* b) {
     visitContiguousMap(v, d->float_constants);
     visitContiguousMap(v, d->imaginary_constants);
     visitContiguousMap(v, d->long_constants);
+    if (!d->keep_alive.empty())
+        v->visitRange((void**)&d->keep_alive[0], (void**)((&d->keep_alive[0]) + d->keep_alive.size()));
 }
 
 // This mustn't throw; our IR generator generates calls to it without "invoke" even when there are exception handlers /
 // finally-blocks in scope.
-// TODO: should we use C++11 `noexcept' here?
 extern "C" Box* boxCLFunction(CLFunction* f, BoxedClosure* closure, Box* globals,
-                              std::initializer_list<Box*> defaults) {
+                              std::initializer_list<Box*> defaults) noexcept {
     STAT_TIMER(t0, "us_timer_boxclfunction", 10);
 
     if (closure)
@@ -710,6 +752,7 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
         }
     }
 
+    static BoxedString* new_str = internStringImmortal("__new__");
     if (rewrite_args) {
         GetattrRewriteArgs grewrite_args(rewrite_args->rewriter, r_ccls, rewrite_args->destination);
         // TODO: if tp_new != Py_CallPythonNew, call that instead?
@@ -762,28 +805,30 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
         }
     }
 
-    bool type_new_special_case;
+    // For debugging, keep track of why we think we can rewrite this:
+    enum { NOT_ALLOWED, VERIFIED, NO_INIT, TYPE_NEW_SPECIAL_CASE, } why_rewrite_allowed = NOT_ALLOWED;
+
     if (rewrite_args) {
-        bool ok = false;
         for (auto b : allowable_news) {
             if (b == new_attr) {
-                ok = true;
+                why_rewrite_allowed = VERIFIED;
                 break;
             }
         }
 
-        if (!ok && (cls == int_cls || cls == float_cls || cls == long_cls)) {
-            if (npassed_args == 1)
-                ok = true;
-            else if (npassed_args == 2 && (arg2->cls == int_cls || arg2->cls == str_cls || arg2->cls == float_cls)) {
+        if (cls == int_cls || cls == float_cls || cls == long_cls) {
+            if (npassed_args == 1) {
+                why_rewrite_allowed = VERIFIED;
+            } else if (npassed_args == 2 && (arg2->cls == int_cls || arg2->cls == str_cls || arg2->cls == float_cls)) {
+                why_rewrite_allowed = NO_INIT;
                 rewrite_args->arg2->addAttrGuard(offsetof(Box, cls), (intptr_t)arg2->cls);
-                ok = true;
             }
         }
 
-        type_new_special_case = (cls == type_cls && argspec == ArgPassSpec(2));
+        if (cls == type_cls && argspec == ArgPassSpec(2))
+            why_rewrite_allowed = TYPE_NEW_SPECIAL_CASE;
 
-        if (!ok && !type_new_special_case) {
+        if (why_rewrite_allowed == NOT_ALLOWED) {
             // Uncomment this to try to find __new__ functions that we could either white- or blacklist:
             // ASSERT(cls->is_user_defined || cls == type_cls, "Does '%s' have a well-behaved __new__?  if so, add to
             // allowable_news, otherwise add to the blacklist in this assert", cls->tp_name);
@@ -791,6 +836,7 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
         }
     }
 
+    static BoxedString* init_str = internStringImmortal("__init__");
     if (rewrite_args) {
         GetattrRewriteArgs grewrite_args(rewrite_args->rewriter, r_ccls, rewrite_args->destination);
         init_attr = typeLookup(cls, init_str, &grewrite_args);
@@ -848,7 +894,8 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
             }
         }
 
-        ASSERT(made->cls == cls || type_new_special_case,
+        ASSERT(made->cls == cls || why_rewrite_allowed == TYPE_NEW_SPECIAL_CASE
+                   || (why_rewrite_allowed == NO_INIT && cls->tp_init == object_cls->tp_init),
                "We should only have allowed the rewrite to continue if we were guaranteed that made "
                "would have class cls!");
     } else {
@@ -872,8 +919,10 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
     // If __new__ returns a subclass, supposed to call that subclass's __init__.
     // If __new__ returns a non-subclass, not supposed to call __init__.
     if (made->cls != cls) {
-        ASSERT(rewrite_args == NULL, "We should only have allowed the rewrite to continue if we were guaranteed that "
-                                     "made would have class cls!");
+        ASSERT(rewrite_args == NULL || (why_rewrite_allowed == NO_INIT && made->cls->tp_init == object_cls->tp_init
+                                        && cls->tp_init == object_cls->tp_init),
+               "We should only have allowed the rewrite to continue if we were guaranteed that "
+               "made would have class cls!");
 
         if (!isSubclass(made->cls, cls)) {
             init_attr = NULL;
@@ -911,6 +960,8 @@ static Box* typeCallInner(CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Bo
                 rewrite_args->rewriter->call(true, (void*)assertInitNone, srewrite_args.out_rtn);
             }
         } else {
+            rewrite_args = NULL;
+
             init_attr = processDescriptor(init_attr, made, cls);
 
             ArgPassSpec init_argspec = argspec;
@@ -1127,11 +1178,6 @@ static void proxy_to_tp_traverse(GCVisitor* v, Box* b) {
     b->cls->tp_traverse(b, call_gc_visit, v);
 }
 
-static void proxy_to_tp_clear(Box* b) {
-    assert(b->cls->tp_clear);
-    b->cls->tp_clear(b);
-}
-
 // This probably belongs in tuple.cpp?
 extern "C" void tupleGCHandler(GCVisitor* v, Box* b) {
     boxGCHandler(v, b);
@@ -1215,7 +1261,7 @@ extern "C" Box* createUserClass(BoxedString* name, Box* _bases, Box* _attr_dict)
         assert(msg);
         // TODO this is an extra Pyston check and I don't think we should have to do it:
         if (isSubclass(e.value->cls, BaseException)) {
-            static BoxedString* message_str = static_cast<BoxedString*>(PyString_InternFromString("message"));
+            static BoxedString* message_str = internStringImmortal("message");
             msg = getattr(e.value, message_str);
         }
 
@@ -1312,7 +1358,7 @@ static Box* functionCall(BoxedFunction* self, Box* args, Box* kwargs) {
     // disallow it but it's good to know.
 
     assert(args->cls == tuple_cls);
-    assert(kwargs->cls == dict_cls);
+    assert(!kwargs || kwargs->cls == dict_cls);
     return runtimeCall(self, ArgPassSpec(0, 0, true, true), args, kwargs, NULL, NULL, NULL);
 }
 
@@ -1371,7 +1417,7 @@ static Box* functionGlobals(Box* self, void*) {
     assert(func->f->source);
     assert(func->f->source->scoping->areGlobalsFromModule());
 
-    static BoxedString* dict_str = static_cast<BoxedString*>(PyString_InternFromString("__dict__"));
+    static BoxedString* dict_str = internStringImmortal("__dict__");
     return getattr(func->f->source->parent_module, dict_str);
 }
 
@@ -1496,7 +1542,7 @@ static Box* instancemethodRepr(Box* b) {
     Box* funcname = NULL, * klassname = NULL, * result = NULL;
     const char* sfuncname = "?", * sklassname = "?";
 
-    static BoxedString* name_str = static_cast<BoxedString*>(PyString_InternFromString("__name__"));
+    static BoxedString* name_str = internStringImmortal("__name__");
     funcname = getattrInternal(func, name_str, NULL);
 
     if (funcname != NULL) {
@@ -1646,6 +1692,8 @@ extern "C" int PySlice_GetIndicesEx(PySliceObject* _r, Py_ssize_t length, Py_ssi
 
     if ((*step < 0 && *stop >= *start) || (*step > 0 && *start >= *stop)) {
         *slicelength = 0;
+    } else if (*step == 1) { // Pyston change: added this branch to make the common step==1 case avoid the div:
+        *slicelength = (*stop - *start - 1) + 1;
     } else if (*step < 0) {
         *slicelength = (*stop - *start + 1) / (*step) + 1;
     } else {
@@ -1674,7 +1722,8 @@ Box* typeRepr(BoxedClass* self) {
     else
         os << "<type '";
 
-    Box* m = self->getattr("__module__");
+    static BoxedString* module_str = internStringImmortal("__module__");
+    Box* m = self->getattr(module_str);
     if (m && m->cls == str_cls) {
         BoxedString* sm = static_cast<BoxedString*>(m);
         if (sm->s() != "__builtin__")
@@ -1695,7 +1744,8 @@ static PyObject* typeModule(Box* _type, void* context) {
     const char* s;
 
     if (type->tp_flags & Py_TPFLAGS_HEAPTYPE) {
-        mod = type->getattr("__module__");
+        static BoxedString* module_str = internStringImmortal("__module__");
+        mod = type->getattr(module_str);
         if (!mod)
             raiseExcHelper(AttributeError, "__module__");
         return mod;
@@ -1719,7 +1769,8 @@ static void typeSetModule(Box* _type, PyObject* value, void* context) {
 
     PyType_Modified(type);
 
-    type->setattr("__module__", value, NULL);
+    static BoxedString* module_str = internStringImmortal("__module__");
+    type->setattr(module_str, value, NULL);
 }
 
 
@@ -1815,7 +1866,7 @@ private:
     // Iterating over the an attrwrapper (~=dict) just gives the keys, which
     // just depends on the hidden class of the object.  Let's store only that:
     HiddenClass* hcls;
-    llvm::StringMap<int>::const_iterator it;
+    llvm::DenseMap<BoxedString*, int>::const_iterator it;
 
 public:
     AttrWrapperIter(AttrWrapper* aw);
@@ -1872,7 +1923,9 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "");
         BoxedString* key = static_cast<BoxedString*>(_key);
-        self->b->setattr(key->s(), value, NULL);
+        internStringMortalInplace(key);
+
+        self->b->setattr(key, value, NULL);
         return None;
     }
 
@@ -1884,10 +1937,12 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "");
         BoxedString* key = static_cast<BoxedString*>(_key);
-        Box* cur = self->b->getattr(key->s());
+        internStringMortalInplace(key);
+
+        Box* cur = self->b->getattr(key);
         if (cur)
             return cur;
-        self->b->setattr(key->s(), value, NULL);
+        self->b->setattr(key, value, NULL);
         return value;
     }
 
@@ -1899,7 +1954,9 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "");
         BoxedString* key = static_cast<BoxedString*>(_key);
-        Box* r = self->b->getattr(key->s());
+        internStringMortalInplace(key);
+
+        Box* r = self->b->getattr(key);
         if (!r)
             return def;
         return r;
@@ -1913,7 +1970,9 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "%s", _key->cls->tp_name);
         BoxedString* key = static_cast<BoxedString*>(_key);
-        Box* r = self->b->getattr(key->s());
+        internStringMortalInplace(key);
+
+        Box* r = self->b->getattr(key);
         if (!r)
             raiseExcHelper(KeyError, "'%s'", key->data());
         return r;
@@ -1927,9 +1986,11 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "");
         BoxedString* key = static_cast<BoxedString*>(_key);
-        Box* r = self->b->getattr(key->s());
+        internStringMortalInplace(key);
+
+        Box* r = self->b->getattr(key);
         if (r) {
-            self->b->delattr(key->s(), NULL);
+            self->b->delattr(key, NULL);
             return r;
         } else {
             if (default_)
@@ -1946,8 +2007,10 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "%s", _key->cls->tp_name);
         BoxedString* key = static_cast<BoxedString*>(_key);
-        if (self->b->getattr(key->s()))
-            self->b->delattr(key->s(), NULL);
+        internStringMortalInplace(key);
+
+        if (self->b->getattr(key))
+            self->b->delattr(key, NULL);
         else
             raiseExcHelper(KeyError, "'%s'", key->data());
         return None;
@@ -1971,7 +2034,7 @@ public:
             first = false;
 
             BoxedString* v = attrs->attr_list->attrs[p.second]->reprICAsString();
-            os << p.first().str() << ": " << v->s();
+            os << p.first->s() << ": " << v->s();
         }
         os << "})";
         return boxString(os.str());
@@ -1985,7 +2048,9 @@ public:
 
         RELEASE_ASSERT(_key->cls == str_cls, "");
         BoxedString* key = static_cast<BoxedString*>(_key);
-        Box* r = self->b->getattr(key->s());
+        internStringMortalInplace(key);
+
+        Box* r = self->b->getattr(key);
         return r ? True : False;
     }
 
@@ -1998,7 +2063,7 @@ public:
         HCAttrs* attrs = self->b->getHCAttrsPtr();
         RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
         for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
-            listAppend(rtn, boxString(p.first()));
+            listAppend(rtn, p.first);
         }
         return rtn;
     }
@@ -2026,7 +2091,7 @@ public:
         HCAttrs* attrs = self->b->getHCAttrsPtr();
         RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
         for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
-            BoxedTuple* t = BoxedTuple::create({ boxString(p.first()), attrs->attr_list->attrs[p.second] });
+            BoxedTuple* t = BoxedTuple::create({ p.first, attrs->attr_list->attrs[p.second] });
             listAppend(rtn, t);
         }
         return rtn;
@@ -2056,7 +2121,7 @@ public:
         HCAttrs* attrs = self->b->getHCAttrsPtr();
         RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
         for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
-            rtn->d[boxString(p.first())] = attrs->attr_list->attrs[p.second];
+            rtn->d[p.first] = attrs->attr_list->attrs[p.second];
         }
         return rtn;
     }
@@ -2091,8 +2156,7 @@ public:
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
         assert(args->cls == tuple_cls);
-        assert(kwargs);
-        assert(kwargs->cls == dict_cls);
+        assert(!kwargs || kwargs->cls == dict_cls);
 
         RELEASE_ASSERT(args->size() <= 1, ""); // should throw a TypeError
 
@@ -2104,7 +2168,7 @@ public:
                 RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON,
                                "");
                 for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
-                    self->b->setattr(p.first(), attrs->attr_list->attrs[p.second], NULL);
+                    self->b->setattr(p.first, attrs->attr_list->attrs[p.second], NULL);
                 }
             } else {
                 // The update rules are too complicated to be worth duplicating here;
@@ -2127,7 +2191,8 @@ public:
         for (auto e : *args) {
             handle(e);
         }
-        handle(kwargs);
+        if (kwargs)
+            handle(kwargs);
 
         return None;
     }
@@ -2146,7 +2211,7 @@ public:
         // In order to not have to reimplement dict cmp: just create a real dict for now and us it.
         BoxedDict* dict = (BoxedDict*)AttrWrapper::copy(_self);
         assert(dict->cls == dict_cls);
-        static BoxedString* eq_str = static_cast<BoxedString*>(PyString_InternFromString("__eq__"));
+        static BoxedString* eq_str = internStringImmortal("__eq__");
         return callattrInternal(dict, eq_str, LookupScope::CLASS_ONLY, NULL, ArgPassSpec(1), _other, NULL, NULL, NULL,
                                 NULL);
     }
@@ -2177,7 +2242,7 @@ Box* AttrWrapperIter::next(Box* _self) {
     RELEASE_ASSERT(self->hcls->type == HiddenClass::NORMAL || self->hcls->type == HiddenClass::SINGLETON, "");
 
     assert(self->it != self->hcls->getStrAttrOffsets().end());
-    Box* r = boxString(self->it->first());
+    Box* r = self->it->first;
     ++self->it;
     return r;
 }
@@ -2224,8 +2289,12 @@ void attrwrapperDel(Box* b, llvm::StringRef attr) {
 
 Box* objectNewNoArgs(BoxedClass* cls) {
     assert(isSubclass(cls->cls, type_cls));
-    assert(typeLookup(cls, "__new__", NULL) == typeLookup(object_cls, "__new__", NULL)
-           && typeLookup(cls, "__init__", NULL) != typeLookup(object_cls, "__init__", NULL));
+#ifndef NDEBUG
+    static BoxedString* new_str = internStringImmortal("__new__");
+    static BoxedString* init_str = internStringImmortal("__init__");
+    assert(typeLookup(cls, new_str, NULL) == typeLookup(object_cls, new_str, NULL)
+           && typeLookup(cls, init_str, NULL) != typeLookup(object_cls, init_str, NULL));
+#endif
     return new (cls) Box();
 }
 
@@ -2733,10 +2802,10 @@ extern "C" PyVarObject* PyObject_InitVar(PyVarObject* op, PyTypeObject* tp, Py_s
     assert(gc::isValidGCMemory(op));
     assert(gc::isValidGCObject(tp));
 
-    gc::setIsPythonObject(op);
-
     Py_TYPE(op) = tp;
     op->ob_size = size;
+
+    gc::registerPythonObject(op);
 
     return op;
 }
@@ -2748,9 +2817,9 @@ extern "C" PyObject* PyObject_Init(PyObject* op, PyTypeObject* tp) noexcept {
     assert(gc::isValidGCMemory(op));
     assert(gc::isValidGCObject(tp));
 
-    gc::setIsPythonObject(op);
-
     Py_TYPE(op) = tp;
+
+    gc::registerPythonObject(op);
 
     if (PyType_SUPPORTS_WEAKREFS(tp)) {
         *PyObject_GET_WEAKREFS_LISTPTR(op) = NULL;
@@ -2876,6 +2945,13 @@ extern "C" PyUnicodeObject* _PyUnicode_New(Py_ssize_t length) noexcept {
     if (!str)
         return (PyUnicodeObject*)PyErr_NoMemory();
 
+#if STAT_ALLOCATIONS
+    {
+        size_t size = sizeof(PyUnicodeObject);
+        ALLOC_STATS(unicode_cls);
+    }
+#endif
+
     // Do a bunch of inlining + constant folding of this line of CPython's:
     // unicode = PyObject_New(PyUnicodeObject, &PyUnicode_Type);
     assert(PyUnicode_Type.tp_basicsize == sizeof(PyUnicodeObject)); // use the compile-time constant
@@ -2906,6 +2982,61 @@ extern "C" PyUnicodeObject* _PyUnicode_New(Py_ssize_t length) noexcept {
     return unicode;
 }
 
+// Normally we don't call the Python tp_ slots that are present to support
+// CPython's reference-counted garbage collection.
+static void setTypeGCProxy(BoxedClass* cls) {
+    cls->tp_alloc = PystonType_GenericAlloc;
+    cls->tp_free = default_free;
+    cls->gc_visit = proxy_to_tp_traverse;
+    cls->has_safe_tp_dealloc = true;
+    cls->is_pyston_class = true;
+}
+
+// By calling this function on a class we assign it Pyston's GC handling
+// and no finalizers.
+static void setTypeGCNone(BoxedClass* cls) {
+    cls->tp_alloc = PystonType_GenericAlloc;
+    cls->tp_free = default_free;
+    cls->tp_dealloc = dealloc_null;
+    cls->has_safe_tp_dealloc = true;
+    cls->is_pyston_class = true;
+}
+
+static void setupDefaultClassGCParticipation() {
+    // some additional setup to ensure weakrefs participate in our GC
+    setTypeGCProxy(&_PyWeakref_RefType);
+    setTypeGCProxy(&_PyWeakref_ProxyType);
+    setTypeGCProxy(&_PyWeakref_CallableProxyType);
+
+    // This is an optimization to speed up the handling of unicode objects,
+    // exception objects, regular expression objects, etc in garbage collection.
+    // There's no reason to have them part of finalizer ordering.
+    //
+    // This is important in tests like django-template which allocates
+    // hundreds of thousands of unicode strings.
+    setTypeGCNone(unicode_cls);
+    unicode_cls->gc_visit = unicode_visit;
+
+    for (BoxedClass* cls : exception_types) {
+        setTypeGCNone(cls);
+    }
+
+    for (int i = 0; Itertool_SafeDealloc_Types[i] != NULL; i++) {
+        setTypeGCNone(Itertool_SafeDealloc_Types[i]);
+    }
+
+    setTypeGCNone(&Scanner_Type);
+    setTypeGCNone(&Match_Type);
+    setTypeGCNone(&Pattern_Type);
+    setTypeGCNone(&PyCallIter_Type);
+
+    // We just changed the has_safe_tp_dealloc field on a few classes, changing
+    // them from having an ordered finalizer to an unordered one.
+    // If some instances of those classes have already been allocated (e.g.
+    // preallocated exceptions), they need to be invalidated.
+    gc::invalidateOrderedFinalizerList();
+}
+
 bool TRACK_ALLOCATIONS = false;
 void setupRuntime() {
 
@@ -2928,6 +3059,9 @@ void setupRuntime() {
     type_cls->tp_itemsize = sizeof(BoxedHeapClass::SlotOffset);
     PyObject_Init(object_cls, type_cls);
     PyObject_Init(type_cls, type_cls);
+    // XXX silly that we have to set this again
+    new (&object_cls->attrs) HCAttrs(HiddenClass::makeSingleton());
+    new (&type_cls->attrs) HCAttrs(HiddenClass::makeSingleton());
 
     none_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(Box), false, NULL);
     None = new (none_cls) Box();
@@ -3008,7 +3142,8 @@ void setupRuntime() {
         BoxedHeapClass(object_cls, &functionGCHandler, 0, offsetof(BoxedBuiltinFunctionOrMethod, in_weakreflist),
                        sizeof(BoxedBuiltinFunctionOrMethod), false,
                        static_cast<BoxedString*>(boxString("builtin_function_or_method")));
-    function_cls->simple_destructor = builtin_function_or_method_cls->simple_destructor = functionDtor;
+    function_cls->tp_dealloc = builtin_function_or_method_cls->tp_dealloc = functionDtor;
+    function_cls->has_safe_tp_dealloc = builtin_function_or_method_cls->has_safe_tp_dealloc = true;
 
 
     module_cls = new (0) BoxedHeapClass(object_cls, &BoxedModule::gcHandler, offsetof(BoxedModule, attrs), 0,
@@ -3243,19 +3378,19 @@ void setupRuntime() {
                                                                    offsetof(BoxedFunction, modname), false));
     function_cls->giveAttr(
         "__doc__", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFunction, doc), false));
-    function_cls->giveAttr("func_doc", function_cls->getattr("__doc__"));
+    function_cls->giveAttr("func_doc", function_cls->getattr(internStringMortal("__doc__")));
     function_cls->giveAttr("__globals__", new (pyston_getset_cls) BoxedGetsetDescriptor(functionGlobals, NULL, NULL));
     function_cls->giveAttr("__get__", new BoxedFunction(boxRTFunction((void*)functionGet, UNKNOWN, 3)));
     function_cls->giveAttr("__call__",
                            new BoxedFunction(boxRTFunction((void*)functionCall, UNKNOWN, 1, 0, true, true)));
     function_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)functionNonzero, BOXED_BOOL, 1)));
     function_cls->giveAttr("func_code", new (pyston_getset_cls) BoxedGetsetDescriptor(functionCode, NULL, NULL));
-    function_cls->giveAttr("__code__", function_cls->getattr("func_code"));
-    function_cls->giveAttr("func_name", function_cls->getattr("__name__"));
+    function_cls->giveAttr("__code__", function_cls->getattr(internStringMortal("func_code")));
+    function_cls->giveAttr("func_name", function_cls->getattr(internStringMortal("__name__")));
     function_cls->giveAttr("func_defaults",
                            new (pyston_getset_cls) BoxedGetsetDescriptor(functionDefaults, functionSetDefaults, NULL));
-    function_cls->giveAttr("__defaults__", function_cls->getattr("func_defaults"));
-    function_cls->giveAttr("func_globals", function_cls->getattr("__globals__"));
+    function_cls->giveAttr("__defaults__", function_cls->getattr(internStringMortal("func_defaults")));
+    function_cls->giveAttr("func_globals", function_cls->getattr(internStringMortal("__globals__")));
     function_cls->freeze();
     function_cls->tp_descr_get = function_descr_get;
 
@@ -3281,10 +3416,10 @@ void setupRuntime() {
         "__call__", new BoxedFunction(boxRTFunction((void*)instancemethodCall, UNKNOWN, 1, 0, true, true)));
     instancemethod_cls->giveAttr(
         "im_func", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedInstanceMethod, func)));
-    instancemethod_cls->giveAttr("__func__", instancemethod_cls->getattr("im_func"));
+    instancemethod_cls->giveAttr("__func__", instancemethod_cls->getattr(internStringMortal("im_func")));
     instancemethod_cls->giveAttr(
         "im_self", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedInstanceMethod, obj)));
-    instancemethod_cls->giveAttr("__self__", instancemethod_cls->getattr("im_self"));
+    instancemethod_cls->giveAttr("__self__", instancemethod_cls->getattr(internStringMortal("im_self")));
     instancemethod_cls->freeze();
 
     instancemethod_cls->giveAttr("im_class", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT,
@@ -3383,32 +3518,7 @@ void setupRuntime() {
     PyMarshal_Init();
     initstrop();
 
-    // some additional setup to ensure weakrefs participate in our GC
-    BoxedClass* weakref_ref_cls = &_PyWeakref_RefType;
-    weakref_ref_cls->tp_alloc = PystonType_GenericAlloc;
-    weakref_ref_cls->tp_dealloc = NULL;
-    weakref_ref_cls->gc_visit = proxy_to_tp_traverse;
-    weakref_ref_cls->simple_destructor = proxy_to_tp_clear;
-    weakref_ref_cls->is_pyston_class = true;
-
-    BoxedClass* weakref_proxy_cls = &_PyWeakref_ProxyType;
-    weakref_proxy_cls->tp_alloc = PystonType_GenericAlloc;
-    weakref_proxy_cls->tp_dealloc = NULL;
-    weakref_proxy_cls->gc_visit = proxy_to_tp_traverse;
-    weakref_proxy_cls->simple_destructor = proxy_to_tp_clear;
-    weakref_proxy_cls->is_pyston_class = true;
-
-    BoxedClass* weakref_callableproxy = &_PyWeakref_CallableProxyType;
-    weakref_callableproxy->tp_alloc = PystonType_GenericAlloc;
-    weakref_callableproxy->tp_dealloc = NULL;
-    weakref_callableproxy->gc_visit = proxy_to_tp_traverse;
-    weakref_callableproxy->simple_destructor = proxy_to_tp_clear;
-    weakref_callableproxy->is_pyston_class = true;
-
-    unicode_cls->tp_alloc = PystonType_GenericAlloc;
-    unicode_cls->gc_visit = unicode_visit;
-    unicode_cls->tp_dealloc = NULL;
-    unicode_cls->is_pyston_class = true;
+    setupDefaultClassGCParticipation();
 
     assert(object_cls->tp_setattro == PyObject_GenericSetAttr);
     assert(none_cls->tp_setattro == PyObject_GenericSetAttr);

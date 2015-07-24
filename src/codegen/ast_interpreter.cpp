@@ -35,9 +35,11 @@
 #include "core/stats.h"
 #include "core/thread_utils.h"
 #include "core/util.h"
+#include "gc/roots.h"
 #include "runtime/generator.h"
 #include "runtime/import.h"
 #include "runtime/inline/boxing.h"
+#include "runtime/inline/list.h"
 #include "runtime/long.h"
 #include "runtime/objmodel.h"
 #include "runtime/set.h"
@@ -75,9 +77,15 @@ public:
     static void deregister(void* frame_addr);
 };
 
+/*
+ * ASTInterpreters exist per function frame - there's no global interpreter object that executes
+ * all non-jitted code!
+ *
+ * The ASTInterpreter inherits from Box as part of garbage collection support.
+ */
 class ASTInterpreter : public Box {
 public:
-    typedef ContiguousMap<InternedString, Box*> SymMap;
+    typedef ContiguousMap<InternedString, Box*, llvm::SmallDenseMap<InternedString, int, 16>> SymMap;
 
     ASTInterpreter(CLFunction* clfunc);
 
@@ -95,7 +103,7 @@ private:
     Box* createFunction(AST* node, AST_arguments* args, const std::vector<AST_stmt*>& body);
     Value doBinOp(Value left, Value right, int op, BinExpType exp_type);
     void doStore(AST_expr* node, Value value);
-    void doStore(InternedString name, Value value);
+    void doStore(AST_Name* name, Value value);
     Box* doOSR(AST_Jump* node);
     Value getNone();
 
@@ -254,7 +262,7 @@ void ASTInterpreter::gcHandler(GCVisitor* visitor, Box* box) {
 
     ASTInterpreter* interp = (ASTInterpreter*)box;
     auto&& vec = interp->sym_table.vector();
-    visitor->visitRange((void* const*)&vec[0], (void* const*)&vec[interp->sym_table.size()]);
+    visitor->visitRange((void* const*)&vec[0], (void* const*)&vec[vec.size()]);
     visitor->visit(interp->passed_closure);
     visitor->visit(interp->created_closure);
     visitor->visit(interp->generator);
@@ -292,24 +300,29 @@ void ASTInterpreter::initArguments(int nargs, BoxedClosure* _closure, BoxedGener
     if (scope_info->createsClosure())
         created_closure = createClosure(passed_closure, scope_info->getClosureSize());
 
-    std::vector<Box*, StlCompatAllocator<Box*>> argsArray{ arg1, arg2, arg3 };
-    for (int i = 3; i < nargs; ++i)
-        argsArray.push_back(args[i - 3]);
-
     const ParamNames& param_names = clfunc->param_names;
 
+    // make sure the AST_Name nodes are set
+    assert(param_names.args.size() == param_names.arg_names.size());
+    assert(param_names.vararg.empty() == (param_names.vararg_name == NULL));
+    assert(param_names.kwarg.empty() == (param_names.kwarg_name == NULL));
+
     int i = 0;
-    for (auto& name : param_names.args) {
-        doStore(source_info->getInternedStrings().get(name), Value(argsArray[i++], 0));
+    for (auto& name : param_names.arg_names) {
+        doStore(name, Value(getArg(i++, arg1, arg2, arg3, args), 0));
     }
 
-    if (!param_names.vararg.str().empty()) {
-        doStore(source_info->getInternedStrings().get(param_names.vararg), Value(argsArray[i++], 0));
+    if (param_names.vararg_name)
+        doStore(param_names.vararg_name, Value(getArg(i++, arg1, arg2, arg3, args), 0));
+
+    if (param_names.kwarg_name) {
+        Box* val = getArg(i++, arg1, arg2, arg3, args);
+        if (!val)
+            val = createDict();
+        doStore(param_names.kwarg_name, Value(val, 0));
     }
 
-    if (!param_names.kwarg.str().empty()) {
-        doStore(source_info->getInternedStrings().get(param_names.kwarg), Value(argsArray[i++], 0));
-    }
+    assert(nargs == i);
 }
 
 RegisterHelper::RegisterHelper() : frame_addr(NULL), interpreter(NULL) {
@@ -499,8 +512,12 @@ Value ASTInterpreter::doBinOp(Value left, Value right, int op, BinExpType exp_ty
     return Value();
 }
 
-void ASTInterpreter::doStore(InternedString name, Value value) {
-    ScopeInfo::VarScopeType vst = scope_info->getScopeTypeOfName(name);
+void ASTInterpreter::doStore(AST_Name* node, Value value) {
+    if (node->lookup_type == ScopeInfo::VarScopeType::UNKNOWN)
+        node->lookup_type = scope_info->getScopeTypeOfName(node->id);
+
+    InternedString name = node->id;
+    ScopeInfo::VarScopeType vst = node->lookup_type;
     if (vst == ScopeInfo::VarScopeType::GLOBAL) {
         if (jit)
             jit->emitSetGlobal(globals, name.getBox(), value);
@@ -534,7 +551,7 @@ void ASTInterpreter::doStore(InternedString name, Value value) {
 void ASTInterpreter::doStore(AST_expr* node, Value value) {
     if (node->type == AST_TYPE::Name) {
         AST_Name* name = (AST_Name*)node;
-        doStore(name->id, value);
+        doStore(name, value);
     } else if (node->type == AST_TYPE::Attribute) {
         AST_Attribute* attr = (AST_Attribute*)node;
         Value o = visit_expr(attr->value);
@@ -711,6 +728,9 @@ Box* ASTInterpreter::doOSR(AST_Jump* node) {
 
     std::map<InternedString, Box*> sorted_symbol_table;
 
+    // TODO: maybe use a different placeholder?
+    static Box* const VAL_UNDEFINED = (Box*)-1;
+
     for (auto& name : phis->definedness.getDefinedNamesAtEnd(current_block)) {
         auto it = sym_table.find(name);
         if (!liveness->isLiveAtEnd(name, current_block))
@@ -722,10 +742,11 @@ Box* ASTInterpreter::doOSR(AST_Jump* node) {
             sorted_symbol_table[getIsDefinedName(name, source_info->getInternedStrings())] = (Box*)is_defined;
             if (is_defined)
                 assert(sym_table.getMapped(it->second) != NULL);
-            sorted_symbol_table[name] = is_defined ? sym_table.getMapped(it->second) : NULL;
+            sorted_symbol_table[name] = is_defined ? sym_table.getMapped(it->second) : VAL_UNDEFINED;
         } else {
             ASSERT(it != sym_table.end(), "%s", name.c_str());
-            sorted_symbol_table[it->first] = sym_table.getMapped(it->second);
+            Box* v = sorted_symbol_table[it->first] = sym_table.getMapped(it->second);
+            assert(gc::isValidGCObject(v));
         }
     }
 
@@ -844,7 +865,7 @@ Value ASTInterpreter::visit_langPrimitive(AST_LangPrimitive* node) {
         const std::string& name = ast_str->str_data;
         assert(name.size());
         // TODO: shouldn't have to rebox here
-        v.o = importFrom(module.o, boxString(name));
+        v.o = importFrom(module.o, internStringMortal(name));
     } else if (node->opcode == AST_LangPrimitive::IMPORT_NAME) {
         abortJITing();
         assert(node->args.size() == 3);
@@ -1128,7 +1149,7 @@ Value ASTInterpreter::visit_assert(AST_Assert* node) {
     assert(v.o->cls == int_cls && static_cast<BoxedInt*>(v.o)->n == 0);
 #endif
 
-    static BoxedString* AssertionError_str = static_cast<BoxedString*>(PyString_InternFromString("AssertionError"));
+    static BoxedString* AssertionError_str = internStringImmortal("AssertionError");
     Box* assertion_type = getGlobal(globals, AssertionError_str);
     assertFail(assertion_type, node->msg ? visit_expr(node->msg).o : 0);
 
@@ -1363,7 +1384,7 @@ Value ASTInterpreter::visit_call(AST_Call* node) {
         CallattrFlags callattr_flags{.cls_only = callattr_clsonly, .null_on_nonexistent = false, .argspec = argspec };
 
         if (jit)
-            v.var = jit->emitCallattr(func, attr.getBox(), callattr_flags, args_vars, keyword_names);
+            v.var = jit->emitCallattr(node, func, attr.getBox(), callattr_flags, args_vars, keyword_names);
 
         v.o = callattr(func.o, attr.getBox(), callattr_flags, args.size() > 0 ? args[0] : 0,
                        args.size() > 1 ? args[1] : 0, args.size() > 2 ? args[2] : 0, args.size() > 3 ? &args[3] : 0,
@@ -1373,7 +1394,7 @@ Value ASTInterpreter::visit_call(AST_Call* node) {
         Value v;
 
         if (jit)
-            v.var = jit->emitRuntimeCall(func, argspec, args_vars, keyword_names);
+            v.var = jit->emitRuntimeCall(node, func, argspec, args_vars, keyword_names);
 
         v.o = runtimeCall(func.o, argspec, args.size() > 0 ? args[0] : 0, args.size() > 1 ? args[1] : 0,
                           args.size() > 2 ? args[2] : 0, args.size() > 3 ? &args[3] : 0, keyword_names);
@@ -1547,10 +1568,15 @@ Value ASTInterpreter::visit_tuple(AST_Tuple* node) {
 
 Value ASTInterpreter::visit_attribute(AST_Attribute* node) {
     Value v = visit_expr(node->value);
-    return Value(pyston::getattr(v.o, node->attr.getBox()), jit ? jit->emitGetAttr(v, node->attr.getBox()) : NULL);
+    return Value(pyston::getattr(v.o, node->attr.getBox()),
+                 jit ? jit->emitGetAttr(v, node->attr.getBox(), node) : NULL);
 }
 }
 
+
+int ASTInterpreterJitInterface::getBoxedLocalsOffset() {
+    return offsetof(ASTInterpreter, frame_info.boxedLocals);
+}
 
 int ASTInterpreterJitInterface::getCurrentBlockOffset() {
     return offsetof(ASTInterpreter, current_block);
@@ -1558,6 +1584,14 @@ int ASTInterpreterJitInterface::getCurrentBlockOffset() {
 
 int ASTInterpreterJitInterface::getCurrentInstOffset() {
     return offsetof(ASTInterpreter, current_inst);
+}
+
+int ASTInterpreterJitInterface::getGeneratorOffset() {
+    return offsetof(ASTInterpreter, generator);
+}
+
+int ASTInterpreterJitInterface::getGlobalsOffset() {
+    return offsetof(ASTInterpreter, globals);
 }
 
 Box* ASTInterpreterJitInterface::derefHelper(void* _interpreter, InternedString s) {
@@ -1581,16 +1615,6 @@ Box* ASTInterpreterJitInterface::doOSRHelper(void* _interpreter, AST_Jump* node)
     if (interpreter->edgecount >= OSR_THRESHOLD_BASELINE)
         return interpreter->doOSR(node);
     return NULL;
-}
-
-Box* ASTInterpreterJitInterface::getBoxedLocalHelper(void* _interpreter, BoxedString* s) {
-    ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
-    return boxedLocalsGet(interpreter->frame_info.boxedLocals, s, interpreter->globals);
-}
-
-Box* ASTInterpreterJitInterface::getBoxedLocalsHelper(void* _interpreter) {
-    ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
-    return interpreter->frame_info.boxedLocals;
 }
 
 Box* ASTInterpreterJitInterface::getLocalHelper(void* _interpreter, InternedString id) {
@@ -1628,17 +1652,6 @@ Box* ASTInterpreterJitInterface::uncacheExcInfoHelper(void* _interpreter) {
     ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
     interpreter->getFrameInfo()->exc = ExcInfo(NULL, NULL, NULL);
     return None;
-}
-
-Box* ASTInterpreterJitInterface::yieldHelper(void* _interpreter, Box* val) {
-    ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
-    return yield(interpreter->generator, val);
-}
-
-void ASTInterpreterJitInterface::setItemNameHelper(void* _interpreter, Box* str, Box* val) {
-    ASTInterpreter* interpreter = (ASTInterpreter*)_interpreter;
-    assert(interpreter->frame_info.boxedLocals != NULL);
-    setitem(interpreter->frame_info.boxedLocals, str, val);
 }
 
 void ASTInterpreterJitInterface::setLocalClosureHelper(void* _interpreter, InternedString id, Box* v) {
@@ -1686,7 +1699,8 @@ Box* astInterpretFunction(CLFunction* clfunc, int nargs, Box* closure, Box* gene
         std::vector<ConcreteCompilerType*> arg_types;
         for (int i = 0; i < nargs; i++) {
             Box* arg = getArg(i, arg1, arg2, arg3, args);
-            assert(arg); // only builtin functions can pass NULL args
+
+            assert(arg || i == clfunc->param_names.kwargsIndex()); // only builtin functions can pass NULL args
 
             // TODO: reenable argument-type specialization
             arg_types.push_back(UNKNOWN);
@@ -1699,6 +1713,7 @@ Box* astInterpretFunction(CLFunction* clfunc, int nargs, Box* closure, Box* gene
 
         clfunc->dependent_interp_callsites.invalidateAll();
 
+        UNAVOIDABLE_STAT_TIMER(t0, "us_timer_in_jitted_code");
         if (closure && generator)
             return optimized->closure_generator_call((BoxedClosure*)closure, (BoxedGenerator*)generator, arg1, arg2,
                                                      arg3, args);
@@ -1749,8 +1764,8 @@ Box* astInterpretFunctionEval(CLFunction* clfunc, Box* globals, Box* boxedLocals
     return v.o ? v.o : None;
 }
 
-Box* astInterpretFrom(CLFunction* clfunc, AST_expr* after_expr, AST_stmt* enclosing_stmt, Box* expr_val,
-                      FrameStackState frame_state) {
+Box* astInterpretDeopt(CLFunction* clfunc, AST_expr* after_expr, AST_stmt* enclosing_stmt, Box* expr_val,
+                       FrameStackState frame_state) {
     assert(clfunc);
     assert(enclosing_stmt);
     assert(frame_state.locals);
@@ -1881,7 +1896,8 @@ BoxedClosure* passedClosureForInterpretedFrame(void* frame_ptr) {
 void setupInterpreter() {
     astinterpreter_cls = BoxedHeapClass::create(type_cls, object_cls, ASTInterpreter::gcHandler, 0, 0,
                                                 sizeof(ASTInterpreter), false, "astinterpreter");
-    astinterpreter_cls->simple_destructor = ASTInterpreter::simpleDestructor;
+    astinterpreter_cls->tp_dealloc = ASTInterpreter::simpleDestructor;
+    astinterpreter_cls->has_safe_tp_dealloc = true;
     astinterpreter_cls->freeze();
 }
 }

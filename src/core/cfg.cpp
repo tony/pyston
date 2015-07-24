@@ -1058,7 +1058,7 @@ private:
         AST_List* rtn = new AST_List();
         rtn->lineno = node->lineno;
         rtn->col_offset = node->col_offset;
-        rtn->ctx_type == node->ctx_type;
+        rtn->ctx_type = node->ctx_type;
 
         for (auto elt : node->elts) {
             rtn->elts.push_back(remapExpr(elt));
@@ -1104,7 +1104,7 @@ private:
         AST_Tuple* rtn = new AST_Tuple();
         rtn->lineno = node->lineno;
         rtn->col_offset = node->col_offset;
-        rtn->ctx_type == node->ctx_type;
+        rtn->ctx_type = node->ctx_type;
 
         for (auto elt : node->elts) {
             rtn->elts.push_back(remapExpr(elt));
@@ -2489,7 +2489,8 @@ CFG* computeCFG(SourceInfo* source, std::vector<AST_stmt*> body) {
             new AST_Name(source->getInternedStrings().get("__module__"), AST_TYPE::Store, source->ast->lineno));
 
         if (source->scoping->areGlobalsFromModule()) {
-            Box* module_name = source->parent_module->getattr("__name__", NULL);
+            static BoxedString* name_str = internStringImmortal("__name__");
+            Box* module_name = source->parent_module->getattr(name_str, NULL);
             assert(module_name->cls == str_cls);
             module_assign->value = new AST_Str(static_cast<BoxedString*>(module_name)->s());
         } else {

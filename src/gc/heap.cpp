@@ -21,6 +21,7 @@
 #include "core/common.h"
 #include "core/util.h"
 #include "gc/gc_alloc.h"
+#include "runtime/objmodel.h"
 #include "runtime/types.h"
 
 #ifndef NVALGRIND
@@ -43,7 +44,7 @@ template <> void return_temporary_buffer<pyston::Box*>(pyston::Box** p) {
 namespace pyston {
 namespace gc {
 
-bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced, std::vector<BoxedClass*>* classes_to_free);
+bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced);
 
 // lots of linked lists around here, so let's just use template functions for operations on them.
 template <class ListT> inline void nullNextPrev(ListT* node) {
@@ -86,16 +87,16 @@ template <class ListT, typename Func> inline void forEach(ListT* list, Func func
 }
 
 template <class ListT, typename Free>
-inline void sweepList(ListT* head, std::vector<Box*>& weakly_referenced, std::vector<BoxedClass*>& classes_to_free,
-                      Free free_func) {
+inline void sweepList(ListT* head, std::vector<Box*>& weakly_referenced, Free free_func) {
     auto cur = head;
     while (cur) {
         GCAllocation* al = cur->data;
+        clearOrderingState(al);
         if (isMarked(al)) {
             clearMark(al);
             cur = cur->next;
         } else {
-            if (_doFree(al, &weakly_referenced, &classes_to_free)) {
+            if (_doFree(al, &weakly_referenced)) {
                 removeFromLL(cur);
 
                 auto to_free = cur;
@@ -118,13 +119,48 @@ void _bytesAllocatedTripped() {
         return;
 
     threading::GLPromoteRegion _lock;
+
     runCollection();
+}
+
+//////
+/// Finalizers
+
+bool hasOrderedFinalizer(BoxedClass* cls) {
+    if (cls->has_safe_tp_dealloc) {
+        ASSERT(!cls->tp_del, "class \"%s\" with safe tp_dealloc also has tp_del?", cls->tp_name);
+        return false;
+    } else if (cls->hasNonDefaultTpDealloc()) {
+        return true;
+    } else {
+        // The default tp_dealloc calls tp_del if there is one.
+        return cls->tp_del != NULL;
+    }
+}
+
+void finalize(Box* b) {
+    GCAllocation* al = GCAllocation::fromUserData(b);
+    assert(!hasFinalized(al));
+    setFinalized(al);
+    b->cls->tp_dealloc(b);
+}
+
+__attribute__((always_inline)) bool isWeaklyReferenced(Box* b) {
+    if (PyType_SUPPORTS_WEAKREFS(b->cls)) {
+        PyWeakReference** list = (PyWeakReference**)PyObject_GET_WEAKREFS_LISTPTR(b);
+        if (list && *list) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 Heap global_heap;
 
-__attribute__((always_inline)) bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced,
-                                            std::vector<BoxedClass*>* classes_to_free) {
+__attribute__((always_inline)) bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced) {
+    static StatCounter gc_safe_destructors("gc_safe_destructor_calls");
+
 #ifndef NVALGRIND
     VALGRIND_DISABLE_ERROR_REPORTING;
 #endif
@@ -142,35 +178,32 @@ __attribute__((always_inline)) bool _doFree(GCAllocation* al, std::vector<Box*>*
         VALGRIND_ENABLE_ERROR_REPORTING;
 #endif
 
-        if (PyType_SUPPORTS_WEAKREFS(b->cls)) {
-            PyWeakReference** list = (PyWeakReference**)PyObject_GET_WEAKREFS_LISTPTR(b);
-            if (list && *list) {
-                assert(weakly_referenced && "attempting to free a weakly referenced object manually");
-                weakly_referenced->push_back(b);
-                return false;
-            }
-        }
-
-        // Note: do this check after the weakrefs check.
-        if (PyType_Check(b)) {
-            assert(classes_to_free);
-            classes_to_free->push_back(static_cast<BoxedClass*>(b));
+        assert(b->cls);
+        if (isWeaklyReferenced(b)) {
+            assert(weakly_referenced && "attempting to free a weakly referenced object manually");
+            weakly_referenced->push_back(b);
             return false;
         }
 
-        // XXX: we are currently ignoring destructors (tp_dealloc) for extension objects, since we have
-        // historically done that (whoops) and there are too many to be worth changing for now as long
-        // as we can get real destructor support soon.
-        ASSERT(b->cls->tp_dealloc == NULL || alloc_kind == GCKind::CONSERVATIVE_PYTHON, "%s", getTypeName(b));
+        ASSERT(!hasOrderedFinalizer(b->cls) || hasFinalized(al) || alloc_kind == GCKind::CONSERVATIVE_PYTHON, "%s",
+               getTypeName(b));
 
-        if (b->cls->simple_destructor)
-            b->cls->simple_destructor(b);
+        if (b->cls->tp_dealloc != dealloc_null && b->cls->has_safe_tp_dealloc) {
+            gc_safe_destructors.log();
+
+            GCAllocation* al = GCAllocation::fromUserData(b);
+            assert(!hasFinalized(al));
+            assert(!hasOrderedFinalizer(b->cls));
+
+            // Don't bother setting the finalized flag since the object is getting freed right now.
+            b->cls->tp_dealloc(b);
+        }
     }
     return true;
 }
 
 void Heap::destructContents(GCAllocation* al) {
-    _doFree(al, NULL, NULL);
+    _doFree(al, NULL);
 }
 
 struct HeapStatistics {
@@ -378,8 +411,8 @@ GCAllocation* SmallArena::allocationFrom(void* ptr) {
     return reinterpret_cast<GCAllocation*>(&b->atoms[atom_idx]);
 }
 
-void SmallArena::freeUnmarked(std::vector<Box*>& weakly_referenced, std::vector<BoxedClass*>& classes_to_free) {
-    thread_caches.forEachValue([this, &weakly_referenced, &classes_to_free](ThreadBlockCache* cache) {
+void SmallArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
+    thread_caches.forEachValue([this, &weakly_referenced](ThreadBlockCache* cache) {
         for (int bidx = 0; bidx < NUM_BUCKETS; bidx++) {
             Block* h = cache->cache_free_heads[bidx];
             // Try to limit the amount of unused memory a thread can hold onto;
@@ -399,8 +432,8 @@ void SmallArena::freeUnmarked(std::vector<Box*>& weakly_referenced, std::vector<
                 insertIntoLL(&heads[bidx], h);
             }
 
-            Block** chain_end = _freeChain(&cache->cache_free_heads[bidx], weakly_referenced, classes_to_free);
-            _freeChain(&cache->cache_full_heads[bidx], weakly_referenced, classes_to_free);
+            Block** chain_end = _freeChain(&cache->cache_free_heads[bidx], weakly_referenced);
+            _freeChain(&cache->cache_full_heads[bidx], weakly_referenced);
 
             while (Block* b = cache->cache_full_heads[bidx]) {
                 removeFromLLAndNull(b);
@@ -410,8 +443,8 @@ void SmallArena::freeUnmarked(std::vector<Box*>& weakly_referenced, std::vector<
     });
 
     for (int bidx = 0; bidx < NUM_BUCKETS; bidx++) {
-        Block** chain_end = _freeChain(&heads[bidx], weakly_referenced, classes_to_free);
-        _freeChain(&full_heads[bidx], weakly_referenced, classes_to_free);
+        Block** chain_end = _freeChain(&heads[bidx], weakly_referenced);
+        _freeChain(&full_heads[bidx], weakly_referenced);
 
         while (Block* b = full_heads[bidx]) {
             removeFromLLAndNull(b);
@@ -438,8 +471,7 @@ void SmallArena::getStatistics(HeapStatistics* stats) {
 }
 
 
-SmallArena::Block** SmallArena::_freeChain(Block** head, std::vector<Box*>& weakly_referenced,
-                                           std::vector<BoxedClass*>& classes_to_free) {
+SmallArena::Block** SmallArena::_freeChain(Block** head, std::vector<Box*>& weakly_referenced) {
     while (Block* b = *head) {
         int num_objects = b->numObjects();
         int first_obj = b->minObjIndex();
@@ -460,10 +492,12 @@ SmallArena::Block** SmallArena::_freeChain(Block** head, std::vector<Box*>& weak
             void* p = &b->atoms[atom_idx];
             GCAllocation* al = reinterpret_cast<GCAllocation*>(p);
 
+            clearOrderingState(al);
             if (isMarked(al)) {
                 clearMark(al);
             } else {
-                if (_doFree(al, &weakly_referenced, &classes_to_free)) {
+                if (_doFree(al, &weakly_referenced)) {
+                    GC_TRACE_LOG("freeing %p\n", al->user_data);
                     b->isfree.set(atom_idx);
 #ifndef NDEBUG
                     memset(al->user_data, 0xbb, b->size - sizeof(GCAllocation));
@@ -693,7 +727,7 @@ GCAllocation* LargeArena::allocationFrom(void* ptr) {
 
 void LargeArena::prepareForCollection() {
     for (LargeObj* lo = head; lo; lo = lo->next) {
-        lookup.push_back(ObjLookupCache(lo, &lo->data[0], lo->size));
+        lookup.push_back(ObjLookupCache(&lo->data[0], lo->size));
     }
     std::sort(lookup.begin(), lookup.end(),
               [](const ObjLookupCache& lo1, const ObjLookupCache& lo2) { return lo1.data < lo2.data; });
@@ -703,8 +737,8 @@ void LargeArena::cleanupAfterCollection() {
     lookup.clear();
 }
 
-void LargeArena::freeUnmarked(std::vector<Box*>& weakly_referenced, std::vector<BoxedClass*>& classes_to_free) {
-    sweepList(head, weakly_referenced, classes_to_free, [this](LargeObj* ptr) { _freeLargeObj(ptr); });
+void LargeArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
+    sweepList(head, weakly_referenced, [this](LargeObj* ptr) { _freeLargeObj(ptr); });
 }
 
 void LargeArena::getStatistics(HeapStatistics* stats) {
@@ -904,7 +938,7 @@ GCAllocation* HugeArena::allocationFrom(void* ptr) {
 
 void HugeArena::prepareForCollection() {
     for (HugeObj* lo = head; lo; lo = lo->next) {
-        lookup.push_back(ObjLookupCache(lo, &lo->data[0], lo->size));
+        lookup.push_back(ObjLookupCache(&lo->data[0], lo->size));
     }
     std::sort(lookup.begin(), lookup.end(),
               [](const ObjLookupCache& lo1, const ObjLookupCache& lo2) { return lo1.data < lo2.data; });
@@ -914,8 +948,8 @@ void HugeArena::cleanupAfterCollection() {
     lookup.clear();
 }
 
-void HugeArena::freeUnmarked(std::vector<Box*>& weakly_referenced, std::vector<BoxedClass*>& classes_to_free) {
-    sweepList(head, weakly_referenced, classes_to_free, [this](HugeObj* ptr) { _freeHugeObj(ptr); });
+void HugeArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
+    sweepList(head, weakly_referenced, [this](HugeObj* ptr) { _freeHugeObj(ptr); });
 }
 
 void HugeArena::getStatistics(HeapStatistics* stats) {

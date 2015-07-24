@@ -31,6 +31,8 @@
 namespace pyston {
 
 extern "C" Box* createTuple(int64_t nelts, Box** elts) {
+    for (int i = 0; i < nelts; i++)
+        assert(gc::isValidGCObject(elts[i]));
     return BoxedTuple::create(nelts, elts);
 }
 
@@ -126,8 +128,7 @@ int BoxedTuple::Resize(BoxedTuple** pv, size_t newsize) noexcept {
         return 0;
     }
 
-    BoxedTuple* resized = new (newsize)
-        BoxedTuple(newsize); // we want an uninitialized tuple, but this will memset it with 0.
+    BoxedTuple* resized = new (newsize) BoxedTuple();
     memmove(resized->elts, t->elts, sizeof(Box*) * t->size());
 
     *pv = resized;
@@ -224,10 +225,8 @@ Box* tupleNonzero(BoxedTuple* self) {
 
 Box* tupleContains(BoxedTuple* self, Box* elt) {
     int size = self->size();
-    for (int i = 0; i < size; i++) {
-        Box* e = self->elts[i];
-
-        int r = PyObject_RichCompareBool(e, elt, Py_EQ);
+    for (Box* e : *self) {
+        int r = PyObject_RichCompareBool(elt, e, Py_EQ);
         if (r == -1)
             throwCAPIException();
 
@@ -263,7 +262,7 @@ extern "C" Box* tupleNew(Box* _cls, BoxedTuple* args, BoxedDict* kwargs) {
                        getNameOfClass(cls));
 
     int args_sz = args->size();
-    int kwargs_sz = kwargs->d.size();
+    int kwargs_sz = kwargs ? kwargs->d.size() : 0;
 
     if (args_sz + kwargs_sz > 1)
         raiseExcHelper(TypeError, "tuple() takes at most 1 argument (%d given)", args_sz + kwargs_sz);

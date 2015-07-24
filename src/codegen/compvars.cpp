@@ -34,10 +34,9 @@
 
 namespace pyston {
 
-static const std::string iter_str = "__iter__";
-static const std::string hasnext_str = "__hasnext__";
-
 CompilerType* CompilerType::getPystonIterType() {
+    static BoxedString* iter_str = internStringImmortal("__iter__");
+    static BoxedString* hasnext_str = internStringImmortal("__hasnext__");
     if (hasattr(iter_str) == Yes) {
         CompilerType* iter_type = getattrType(iter_str, true)->callType(ArgPassSpec(0), {}, NULL);
         if (iter_type->hasattr(hasnext_str) == Yes)
@@ -48,7 +47,7 @@ CompilerType* CompilerType::getPystonIterType() {
     return UNKNOWN;
 }
 
-CompilerType::Result CompilerType::hasattr(llvm::StringRef attr) {
+CompilerType::Result CompilerType::hasattr(BoxedString* attr) {
     CompilerType* type = getattrType(attr, true);
     if (type == UNKNOWN)
         return Result::Maybe;
@@ -299,7 +298,7 @@ public:
         return rtn;
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override { return UNKNOWN; }
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override { return UNKNOWN; }
     CompilerType* callType(ArgPassSpec argspec, const std::vector<CompilerType*>& arg_types,
                            const std::vector<llvm::StringRef>* keyword_names) override {
         return UNKNOWN;
@@ -357,7 +356,7 @@ public:
     }
 
     CompilerVariable* getPystonIter(IREmitter& emitter, const OpInfo& info, ConcreteCompilerVariable* var) override {
-        static BoxedString* iter_box = static_cast<BoxedString*>(PyString_InternFromString("__iter__"));
+        static BoxedString* iter_box = internStringImmortal("__iter__");
 
         CallattrFlags flags = {.cls_only = true, .null_on_nonexistent = true, .argspec = ArgPassSpec(0) };
         CompilerVariable* iter_call = var->callattr(emitter, info, iter_box, flags, {}, 0);
@@ -453,6 +452,10 @@ public:
         }
 
         return new ConcreteCompilerVariable(UNKNOWN, rtn, true);
+    }
+
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return lhs->binexp(emitter, info, var, AST_TYPE::In, Compare);
     }
 
     Box* deserializeFromFrame(const FrameVals& vals) override {
@@ -776,7 +779,7 @@ public:
 
     bool canConvertTo(ConcreteCompilerType* other_type) override { return other_type == UNKNOWN; }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override { return UNDEF; }
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override { return UNDEF; }
 
     CompilerType* callType(ArgPassSpec argspec, const std::vector<CompilerType*>& arg_types,
                            const std::vector<llvm::StringRef>* keyword_names) override {
@@ -857,7 +860,7 @@ public:
         // pass
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override {
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override {
         /*
         static std::vector<AbstractFunctionType::Sig*> sigs;
         if (sigs.size() == 0) {
@@ -899,8 +902,9 @@ public:
         }
 
         // we can handle those operations when the rhs is a float
-        if (attr == "__add__" || attr == "__sub__" || attr == "__mul__" || attr == "__div__" || attr == "__pow__"
-            || attr == "__floordiv__" || attr == "__mod__" || attr == "__pow__") {
+        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__div__"
+            || attr->s() == "__pow__" || attr->s() == "__floordiv__" || attr->s() == "__mod__"
+            || attr->s() == "__pow__") {
             return AbstractFunctionType::get(sigs);
         }
         return BOXED_INT->getattrType(attr, cls_only);
@@ -1081,6 +1085,10 @@ public:
         }
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return makeBool(false);
+    }
+
     ConcreteCompilerType* getBoxType() override { return BOXED_INT; }
 
     Box* deserializeFromFrame(const FrameVals& vals) override {
@@ -1110,7 +1118,7 @@ public:
         // pass
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override {
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override {
         static std::vector<AbstractFunctionType::Sig*> sigs;
         if (sigs.size() == 0) {
             AbstractFunctionType::Sig* float_sig = new AbstractFunctionType::Sig();
@@ -1129,13 +1137,15 @@ public:
             sigs.push_back(unknown_sig);
         }
 
-        if (attr == "__add__" || attr == "__sub__" || attr == "__mul__" || attr == "__div__" || attr == "__pow__"
-            || attr == "__floordiv__" || attr == "__mod__" || attr == "__pow__") {
+        if (attr->s() == "__add__" || attr->s() == "__sub__" || attr->s() == "__mul__" || attr->s() == "__div__"
+            || attr->s() == "__pow__" || attr->s() == "__floordiv__" || attr->s() == "__mod__"
+            || attr->s() == "__pow__") {
             return AbstractFunctionType::get(sigs);
         }
 
-        if (attr == "__iadd__" || attr == "__isub__" || attr == "__imul__" || attr == "__idiv__" || attr == "__ipow__"
-            || attr == "__ifloordiv__" || attr == "__imod__" || attr == "__ipow__") {
+        if (attr->s() == "__iadd__" || attr->s() == "__isub__" || attr->s() == "__imul__" || attr->s() == "__idiv__"
+            || attr->s() == "__ipow__" || attr->s() == "__ifloordiv__" || attr->s() == "__imod__"
+            || attr->s() == "__ipow__") {
             return AbstractFunctionType::get(sigs);
         }
 
@@ -1319,6 +1329,10 @@ public:
         return rtn;
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return makeBool(false);
+    }
+
     ConcreteCompilerType* getBoxType() override { return BOXED_FLOAT; }
 
     Box* deserializeFromFrame(const FrameVals& vals) override {
@@ -1434,7 +1448,7 @@ public:
                 && cls->hasGenericGetattr());
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override {
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override {
         // Any changes here need to be mirrored in getattr()
         if (canStaticallyResolveGetattrs()) {
             Box* rtattr = typeLookup(cls, attr, nullptr);
@@ -1462,7 +1476,7 @@ public:
                               bool cls_only) override {
         // Any changes here need to be mirrored in getattrType()
         if (canStaticallyResolveGetattrs()) {
-            Box* rtattr = typeLookup(cls, attr->s(), nullptr);
+            Box* rtattr = typeLookup(cls, attr, nullptr);
             if (rtattr == NULL) {
                 llvm::CallSite call = emitter.createCall3(
                     info.unw_info, g.funcs.raiseAttributeErrorStr, embedRelocatablePtr(cls->tp_name, g.i8_ptr),
@@ -1512,7 +1526,7 @@ public:
         if (!canStaticallyResolveGetattrs())
             return NULL;
 
-        Box* rtattr = cls->getattr(attr->s());
+        Box* rtattr = cls->getattr(attr);
         if (rtattr == NULL) {
             if (no_attribute) {
                 *no_attribute = true;
@@ -1688,8 +1702,12 @@ public:
         return rtn;
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return UNKNOWN->contains(emitter, info, var, lhs);
+    }
+
     CompilerVariable* getitem(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* slice) override {
-        static BoxedString* attr = static_cast<BoxedString*>(PyString_InternFromString("__getitem__"));
+        static BoxedString* attr = internStringImmortal("__getitem__");
         bool no_attribute = false;
         ConcreteCompilerVariable* called_constant = tryCallattrConstant(
             emitter, info, var, attr, true, ArgPassSpec(1, 0, 0, 0), { slice }, NULL, &no_attribute);
@@ -1715,7 +1733,7 @@ public:
     }
 
     ConcreteCompilerVariable* len(IREmitter& emitter, const OpInfo& info, VAR* var) override {
-        static BoxedString* attr = static_cast<BoxedString*>(PyString_InternFromString("__len__"));
+        static BoxedString* attr = internStringImmortal("__len__");
         ConcreteCompilerVariable* called_constant
             = tryCallattrConstant(emitter, info, var, attr, true, ArgPassSpec(0, 0, 0, 0), {}, NULL);
         if (called_constant)
@@ -1725,7 +1743,7 @@ public:
     }
 
     ConcreteCompilerVariable* nonzero(IREmitter& emitter, const OpInfo& info, ConcreteCompilerVariable* var) override {
-        static BoxedString* attr = static_cast<BoxedString*>(PyString_InternFromString("__nonzero__"));
+        static BoxedString* attr = internStringImmortal("__nonzero__");
 
         bool no_attribute = false;
         ConcreteCompilerVariable* called_constant
@@ -1749,7 +1767,7 @@ public:
     }
 
     ConcreteCompilerVariable* hasnext(IREmitter& emitter, const OpInfo& info, ConcreteCompilerVariable* var) override {
-        static BoxedString* attr = static_cast<BoxedString*>(PyString_InternFromString("__hasnext__"));
+        static BoxedString* attr = internStringImmortal("__hasnext__");
 
         ConcreteCompilerVariable* called_constant
             = tryCallattrConstant(emitter, info, var, attr, true, ArgPassSpec(0, 0, 0, 0), {}, NULL, NULL);
@@ -1914,6 +1932,13 @@ public:
         return rtn;
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        ConcreteCompilerVariable* converted = var->makeConverted(emitter, STR);
+        CompilerVariable* rtn = converted->contains(emitter, info, lhs);
+        converted->decvref(emitter);
+        return rtn;
+    }
+
     ConcreteCompilerVariable* nonzero(IREmitter& emitter, const OpInfo& info, VAR* var) override {
         return makeBool(var->getValue()->size() != 0);
     }
@@ -2004,7 +2029,7 @@ public:
         return new ConcreteCompilerVariable(other_type, boxed, true);
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override {
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override {
         return BOXED_BOOL->getattrType(attr, cls_only);
     }
 
@@ -2033,6 +2058,10 @@ public:
         return rtn;
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return makeBool(false);
+    }
+
     ConcreteCompilerType* getBoxType() override { return BOXED_BOOL; }
 
     Box* deserializeFromFrame(const FrameVals& vals) override {
@@ -2045,6 +2074,23 @@ public:
 ConcreteCompilerType* BOOL = new BoolType();
 ConcreteCompilerVariable* makeBool(bool b) {
     return new ConcreteCompilerVariable(BOOL, llvm::ConstantInt::get(BOOL->llvmType(), b, false), true);
+}
+
+ConcreteCompilerVariable* doIs(IREmitter& emitter, CompilerVariable* lhs, CompilerVariable* rhs, bool negate) {
+    // TODO: I think we can do better here and not force the types to box themselves
+
+    ConcreteCompilerVariable* converted_left = lhs->makeConverted(emitter, UNKNOWN);
+    ConcreteCompilerVariable* converted_right = rhs->makeConverted(emitter, UNKNOWN);
+    llvm::Value* cmp;
+    if (!negate)
+        cmp = emitter.getBuilder()->CreateICmpEQ(converted_left->getValue(), converted_right->getValue());
+    else
+        cmp = emitter.getBuilder()->CreateICmpNE(converted_left->getValue(), converted_right->getValue());
+
+    converted_left->decvref(emitter);
+    converted_right->decvref(emitter);
+
+    return boolFromI1(emitter, cmp);
 }
 
 ConcreteCompilerType* BOXED_TUPLE;
@@ -2184,7 +2230,7 @@ public:
         return new ConcreteCompilerVariable(INT, getConstantInt(var->getValue()->size(), g.i64), true);
     }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override {
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override {
         return BOXED_TUPLE->getattrType(attr, cls_only);
     }
 
@@ -2194,6 +2240,58 @@ public:
         CompilerVariable* rtn = converted->binexp(emitter, info, rhs, op_type, exp_type);
         converted->decvref(emitter);
         return rtn;
+    }
+
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        llvm::SmallVector<std::pair<llvm::BasicBlock*, llvm::Value*>, 4> phi_incoming;
+
+        llvm::BasicBlock* end = emitter.createBasicBlock();
+
+        ConcreteCompilerVariable* converted_lhs = lhs->makeConverted(emitter, lhs->getConcreteType());
+
+        for (CompilerVariable* e : *var->getValue()) {
+            // TODO: we could potentially avoid the identity tests if we know that either type has
+            // an __eq__ that is reflexive (returns True for the same object).
+            {
+                ConcreteCompilerVariable* is_same = doIs(emitter, converted_lhs, e, false);
+                llvm::Value* raw = i1FromBool(emitter, is_same);
+
+                phi_incoming.push_back(std::make_pair(emitter.currentBasicBlock(), getConstantInt(1, g.i1)));
+                llvm::BasicBlock* new_bb = emitter.createBasicBlock();
+                new_bb->moveAfter(emitter.currentBasicBlock());
+                emitter.getBuilder()->CreateCondBr(raw, end, new_bb);
+                emitter.setCurrentBasicBlock(new_bb);
+            }
+
+            {
+                CompilerVariable* eq = converted_lhs->binexp(emitter, info, e, AST_TYPE::Eq, Compare);
+                ConcreteCompilerVariable* eq_nonzero = eq->nonzero(emitter, info);
+                assert(eq_nonzero->getType() == BOOL);
+                llvm::Value* raw = i1FromBool(emitter, eq_nonzero);
+
+                phi_incoming.push_back(std::make_pair(emitter.currentBasicBlock(), getConstantInt(1, g.i1)));
+                llvm::BasicBlock* new_bb = emitter.createBasicBlock();
+                new_bb->moveAfter(emitter.currentBasicBlock());
+                emitter.getBuilder()->CreateCondBr(raw, end, new_bb);
+                emitter.setCurrentBasicBlock(new_bb);
+            }
+        }
+
+        // TODO This last block is unnecessary:
+        phi_incoming.push_back(std::make_pair(emitter.currentBasicBlock(), getConstantInt(0, g.i1)));
+        emitter.getBuilder()->CreateBr(end);
+
+        end->moveAfter(emitter.currentBasicBlock());
+        emitter.setCurrentBasicBlock(end);
+
+        auto phi = emitter.getBuilder()->CreatePHI(g.i1, phi_incoming.size());
+        for (auto p : phi_incoming) {
+            phi->addIncoming(p.second, p.first);
+        }
+
+        converted_lhs->decvref(emitter);
+
+        return boolFromI1(emitter, phi);
     }
 
     CompilerVariable* callattr(IREmitter& emitter, const OpInfo& info, VAR* var, BoxedString* attr, CallattrFlags flags,
@@ -2320,6 +2418,10 @@ public:
         return undefVariable();
     }
 
+    CompilerVariable* contains(IREmitter& emitter, const OpInfo& info, VAR* var, CompilerVariable* lhs) override {
+        return undefVariable();
+    }
+
     CompilerVariable* getitem(IREmitter& emitter, const OpInfo& info, ConcreteCompilerVariable* var,
                               CompilerVariable* slice) override {
         return undefVariable();
@@ -2329,7 +2431,7 @@ public:
 
     ConcreteCompilerType* getConcreteType() override { return this; }
 
-    CompilerType* getattrType(llvm::StringRef attr, bool cls_only) override { return UNDEF; }
+    CompilerType* getattrType(BoxedString* attr, bool cls_only) override { return UNDEF; }
 
     bool canConvertTo(ConcreteCompilerType* other_type) override { return true; }
 

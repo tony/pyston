@@ -17,6 +17,7 @@
 
 #include "Python.h"
 
+#include "capi/typeobject.h"
 #include "capi/types.h"
 #include "core/ast.h"
 #include "core/threading.h"
@@ -404,10 +405,24 @@ static int recursive_isinstance(PyObject* inst, PyObject* cls) noexcept {
     } else if (PyType_Check(cls)) {
         retval = PyObject_TypeCheck(inst, (PyTypeObject*)cls);
         if (retval == 0) {
-            PyObject* c = PyObject_GetAttr(inst, __class__);
-            if (c == NULL) {
-                PyErr_Clear();
+            PyObject* c = NULL;
+
+            if (!inst->cls->has_getattribute) {
+                assert(inst->cls->tp_getattr == object_cls->tp_getattr);
+                assert(inst->cls->tp_getattro == object_cls->tp_getattro
+                       || inst->cls->tp_getattro == slot_tp_getattr_hook);
+            }
+            // We don't need to worry about __getattr__, since the default __class__ will always resolve.
+            bool has_custom_class = inst->cls->has___class__ || inst->cls->has_getattribute;
+            if (!has_custom_class) {
+                assert(PyObject_GetAttr(inst, __class__) == inst->cls);
             } else {
+                c = PyObject_GetAttr(inst, __class__);
+                if (!c)
+                    PyErr_Clear();
+            }
+
+            if (c) {
                 if (c != (PyObject*)(inst->cls) && PyType_Check(c))
                     retval = PyType_IsSubtype((PyTypeObject*)c, (PyTypeObject*)cls);
                 Py_DECREF(c);
@@ -435,6 +450,8 @@ extern "C" int _PyObject_RealIsInstance(PyObject* inst, PyObject* cls) noexcept 
 }
 
 extern "C" int PyObject_IsInstance(PyObject* inst, PyObject* cls) noexcept {
+    STAT_TIMER(t0, "us_timer_pyobject_isinstance", 20);
+
     static PyObject* name = NULL;
 
     /* Quick test for an exact match */
@@ -461,8 +478,15 @@ extern "C" int PyObject_IsInstance(PyObject* inst, PyObject* cls) noexcept {
     }
 
     if (!(PyClass_Check(cls) || PyInstance_Check(cls))) {
-        PyObject* checker;
-        checker = _PyObject_LookupSpecial(cls, "__instancecheck__", &name);
+        PyObject* checker = NULL;
+        if (cls->cls->has_instancecheck) {
+            checker = _PyObject_LookupSpecial(cls, "__instancecheck__", &name);
+            if (!checker && PyErr_Occurred())
+                return -1;
+
+            assert(checker);
+        }
+
         if (checker != NULL) {
             PyObject* res;
             int ok = -1;
@@ -478,8 +502,7 @@ extern "C" int PyObject_IsInstance(PyObject* inst, PyObject* cls) noexcept {
                 Py_DECREF(res);
             }
             return ok;
-        } else if (PyErr_Occurred())
-            return -1;
+        }
     }
     return recursive_isinstance(inst, cls);
 }
@@ -1441,14 +1464,55 @@ extern "C" PyObject* PySequence_GetItem(PyObject* o, Py_ssize_t i) noexcept {
     }
 }
 
-extern "C" PyObject* PySequence_GetSlice(PyObject* o, Py_ssize_t i1, Py_ssize_t i2) noexcept {
-    try {
-        // Not sure if this is really the same:
-        return getitem(o, createSlice(boxInt(i1), boxInt(i2), None));
-    } catch (ExcInfo e) {
-        fatalOrError(PyExc_NotImplementedError, "unimplemented");
-        return nullptr;
+PyObject* _PySlice_FromIndices(Py_ssize_t istart, Py_ssize_t istop) {
+    PyObject* start, *end, *slice;
+    start = PyInt_FromSsize_t(istart);
+    if (!start)
+        return NULL;
+    end = PyInt_FromSsize_t(istop);
+    if (!end) {
+        Py_DECREF(start);
+        return NULL;
     }
+
+    slice = PySlice_New(start, end, NULL);
+    Py_DECREF(start);
+    Py_DECREF(end);
+    return slice;
+}
+
+extern "C" PyObject* PySequence_GetSlice(PyObject* s, Py_ssize_t i1, Py_ssize_t i2) noexcept {
+    PySequenceMethods* m;
+    PyMappingMethods* mp;
+
+    if (!s)
+        return null_error();
+
+    m = s->cls->tp_as_sequence;
+    if (m && m->sq_slice) {
+        if (i1 < 0 || i2 < 0) {
+            if (m->sq_length) {
+                Py_ssize_t l = (*m->sq_length)(s);
+                if (l < 0)
+                    return NULL;
+                if (i1 < 0)
+                    i1 += l;
+                if (i2 < 0)
+                    i2 += l;
+            }
+        }
+        return m->sq_slice(s, i1, i2);
+    } else if ((mp = s->cls->tp_as_mapping) && mp->mp_subscript) {
+        PyObject* res;
+        PyObject* slice = _PySlice_FromIndices(i1, i2);
+        if (!slice)
+            return NULL;
+        res = mp->mp_subscript(s, slice);
+        Py_DECREF(slice);
+        return res;
+    }
+
+    return type_error("'%.200s' object is unsliceable", s);
 }
 
 extern "C" int PySequence_SetItem(PyObject* o, Py_ssize_t i, PyObject* v) noexcept {

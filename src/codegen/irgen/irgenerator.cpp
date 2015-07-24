@@ -493,7 +493,10 @@ private:
         assert(ast);
 
         EffortLevel effort = irstate->getEffortLevel();
-        bool record_types = effort != EffortLevel::MAXIMAL;
+        // This is the only place we create type recorders for the llvm tier;
+        // if we are ok with never doing that there's a bunch of code that could
+        // be removed.
+        bool record_types = false;
 
         TypeRecorder* type_recorder;
         if (record_types) {
@@ -639,8 +642,9 @@ private:
                 const std::string& name = ast_str->str_data;
                 assert(name.size());
 
-                llvm::Value* name_arg = embedRelocatablePtr(
-                    irstate->getSourceInfo()->parent_module->getStringConstant(name), g.llvm_boxedstring_type_ptr);
+                llvm::Value* name_arg
+                    = embedRelocatablePtr(irstate->getSourceInfo()->parent_module->getStringConstant(name, true),
+                                          g.llvm_boxedstring_type_ptr);
                 llvm::Value* r
                     = emitter.createCall2(unw_info, g.funcs.importFrom, converted_module->getValue(), name_arg);
 
@@ -763,6 +767,19 @@ private:
         assert(left);
         assert(right);
 
+        if (type == AST_TYPE::In || type == AST_TYPE::NotIn) {
+            CompilerVariable* r = right->contains(emitter, getOpInfoForNode(node, unw_info), left);
+            assert(r->getType() == BOOL);
+            if (type == AST_TYPE::NotIn) {
+                ConcreteCompilerVariable* converted = r->makeConverted(emitter, BOOL);
+                // TODO: would be faster to just do unboxBoolNegated
+                llvm::Value* raw = i1FromBool(emitter, converted);
+                raw = emitter.getBuilder()->CreateXor(raw, getConstantInt(1, g.i1));
+                r = boolFromI1(emitter, raw);
+            }
+            return r;
+        }
+
         return left->binexp(emitter, getOpInfoForNode(node, unw_info), right, type, exp_type);
     }
 
@@ -800,17 +817,7 @@ private:
         assert(right);
 
         if (node->ops[0] == AST_TYPE::Is || node->ops[0] == AST_TYPE::IsNot) {
-            // TODO: I think we can do better here and not force the types to box themselves
-
-            ConcreteCompilerVariable* converted_left = left->makeConverted(emitter, UNKNOWN);
-            ConcreteCompilerVariable* converted_right = right->makeConverted(emitter, UNKNOWN);
-            llvm::Value* cmp;
-            if (node->ops[0] == AST_TYPE::Is)
-                cmp = emitter.getBuilder()->CreateICmpEQ(converted_left->getValue(), converted_right->getValue());
-            else
-                cmp = emitter.getBuilder()->CreateICmpNE(converted_left->getValue(), converted_right->getValue());
-
-            return boolFromI1(emitter, cmp);
+            return doIs(emitter, left, right, node->ops[0] == AST_TYPE::IsNot);
         }
 
         CompilerVariable* rtn = _evalBinExp(node, left, right, node->ops[0], Compare, unw_info);
@@ -888,7 +895,7 @@ private:
         llvm::Value* v = emitter.getBuilder()->CreateCall(g.funcs.createDict);
         ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(DICT, v, true);
         if (node->keys.size()) {
-            static BoxedString* setitem_str = static_cast<BoxedString*>(PyString_InternFromString("__setitem__"));
+            static BoxedString* setitem_str = internStringImmortal("__setitem__");
             CompilerVariable* setitem = rtn->getattr(emitter, getEmptyOpInfo(unw_info), setitem_str, true);
             for (int i = 0; i < node->keys.size(); i++) {
                 CompilerVariable* key = evalExpr(node->keys[i], unw_info);
@@ -1130,7 +1137,7 @@ private:
         llvm::Value* v = emitter.getBuilder()->CreateCall(g.funcs.createSet);
         ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(SET, v, true);
 
-        static BoxedString* add_str = static_cast<BoxedString*>(PyString_InternFromString("add"));
+        static BoxedString* add_str = internStringImmortal("add");
 
         for (int i = 0; i < node->elts.size(); i++) {
             CompilerVariable* elt = elts[i];
@@ -1716,7 +1723,7 @@ private:
 
         // We could patchpoint this or try to avoid the overhead, but this should only
         // happen when the assertion is actually thrown so I don't think it will be necessary.
-        static BoxedString* AssertionError_str = static_cast<BoxedString*>(PyString_InternFromString("AssertionError"));
+        static BoxedString* AssertionError_str = internStringImmortal("AssertionError");
         llvm_args.push_back(emitter.createCall2(unw_info, g.funcs.getGlobal, embedParentModulePtr(),
                                                 embedRelocatablePtr(AssertionError_str, g.llvm_boxedstring_type_ptr)));
 
@@ -1879,9 +1886,9 @@ private:
         }
         assert(dest);
 
-        static BoxedString* write_str = static_cast<BoxedString*>(PyString_InternFromString("write"));
-        static BoxedString* newline_str = static_cast<BoxedString*>(PyString_InternFromString("\n"));
-        static BoxedString* space_str = static_cast<BoxedString*>(PyString_InternFromString(" "));
+        static BoxedString* write_str = internStringImmortal("write");
+        static BoxedString* newline_str = internStringImmortal("\n");
+        static BoxedString* space_str = internStringImmortal(" ");
 
         // TODO: why are we inline-generating all this code instead of just emitting a call to some runtime function?
         // (=printHelper())
@@ -2607,7 +2614,24 @@ public:
         }
 
         if (param_names.kwarg.size()) {
-            loadArgument(internString(param_names.kwarg), arg_types[i], python_parameters[i], UnwindInfo::cantUnwind());
+            llvm::BasicBlock* starting_block = emitter.currentBasicBlock();
+            llvm::BasicBlock* isnull_bb = emitter.createBasicBlock("isnull");
+            llvm::BasicBlock* continue_bb = emitter.createBasicBlock("kwargs_join");
+
+            llvm::Value* kwargs_null
+                = emitter.getBuilder()->CreateICmpEQ(python_parameters[i], getNullPtr(g.llvm_value_type_ptr));
+            llvm::BranchInst* null_check = emitter.getBuilder()->CreateCondBr(kwargs_null, isnull_bb, continue_bb);
+
+            emitter.setCurrentBasicBlock(isnull_bb);
+            llvm::Value* created_dict = emitter.getBuilder()->CreateCall(g.funcs.createDict);
+            emitter.getBuilder()->CreateBr(continue_bb);
+
+            emitter.setCurrentBasicBlock(continue_bb);
+            llvm::PHINode* phi = emitter.getBuilder()->CreatePHI(g.llvm_value_type_ptr, 2);
+            phi->addIncoming(python_parameters[i], starting_block);
+            phi->addIncoming(created_dict, isnull_bb);
+
+            loadArgument(internString(param_names.kwarg), arg_types[i], phi, UnwindInfo::cantUnwind());
             i++;
         }
 
@@ -2643,13 +2667,9 @@ public:
     }
 
     void doSafePoint(AST_stmt* next_statement) override {
-// If the sampling profiler is turned on (and eventually, destructors), we need frame-introspection
-// support while in allowGLReadPreemption:
-#if ENABLE_SAMPLING_PROFILER
+        // Unwind info is always needed in allowGLReadPreemption if it has any chance of
+        // running arbitrary code like finalizers.
         emitter.createCall(UnwindInfo(next_statement, NULL), g.funcs.allowGLReadPreemption);
-#else
-        emitter.getBuilder()->CreateCall(g.funcs.allowGLReadPreemption);
-#endif
     }
 };
 

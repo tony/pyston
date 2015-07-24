@@ -18,6 +18,7 @@ USE_CCACHE := 1
 USE_DISTCC := 0
 
 PYPY := pypy
+CPYTHON := python
 
 ENABLE_VALGRIND := 0
 
@@ -59,8 +60,9 @@ FORCE_TRUNK_BINARIES := 0
 NINJA := ninja
 
 CMAKE_DIR_DBG := $(BUILD_DIR)/Debug
-CMAKE_DIR_DBG_GCC := $(BUILD_DIR)/Debug-gcc
 CMAKE_DIR_RELEASE := $(BUILD_DIR)/Release
+CMAKE_DIR_GCC := $(BUILD_DIR)/Debug-gcc
+CMAKE_DIR_RELEASE_GCC := $(BUILD_DIR)/Release-gcc
 CMAKE_SETUP_DBG := $(CMAKE_DIR_DBG)/build.ninja
 CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
 
@@ -69,7 +71,7 @@ CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
 
 
 ifneq ($(SELF_HOST),1)
-	PYTHON := python
+	PYTHON := $(CPYTHON)
 	PYTHON_EXE_DEPS :=
 else
 	PYTHON := $(abspath ./pyston_dbg)
@@ -77,8 +79,8 @@ else
 endif
 
 TOOLS_DIR := ./tools
-TEST_DIR := ./test
-TESTS_DIR := ./test/tests
+TEST_DIR := $(abspath ./test)
+TESTS_DIR := $(abspath ./test/tests)
 
 GPP := $(GCC_DIR)/bin/g++
 GCC := $(GCC_DIR)/bin/gcc
@@ -184,7 +186,7 @@ COMMON_CXXFLAGS += -I$(DEPS_DIR)/lz4-install/include
 ifeq ($(ENABLE_VALGRIND),0)
 	COMMON_CXXFLAGS += -DNVALGRIND
 	VALGRIND := false
-	CMAKE_VALGRIND := 
+	CMAKE_VALGRIND :=
 else
 	COMMON_CXXFLAGS += -I$(DEPS_DIR)/valgrind-3.10.0/include
 	VALGRIND := VALGRIND_LIB=$(DEPS_DIR)/valgrind-3.10.0-install/lib/valgrind $(DEPS_DIR)/valgrind-3.10.0-install/bin/valgrind
@@ -894,7 +896,6 @@ pyston_release: $(CMAKE_SETUP_RELEASE)
 	$(NINJA) -C $(CMAKE_DIR_RELEASE) pyston copy_stdlib copy_libpyston $(CMAKE_SHAREDMODS) ext_cpython $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_RELEASE)/pyston pyston_release
 
-CMAKE_DIR_GCC := $(CMAKE_DIR_DBG_GCC)
 CMAKE_SETUP_GCC := $(CMAKE_DIR_GCC)/build.ninja
 $(CMAKE_SETUP_GCC):
 	@$(MAKE) cmake_check
@@ -902,8 +903,18 @@ $(CMAKE_SETUP_GCC):
 	cd $(CMAKE_DIR_GCC); CC='$(GCC)' CXX='$(GPP)' cmake -GNinja $(SRC_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_VALGRIND)
 .PHONY: pyston_gcc
 pyston_gcc: $(CMAKE_SETUP_GCC)
-	$(NINJA) -C $(CMAKE_DIR_DBG_GCC) pyston copy_stdlib copy_libpyston sharedmods ext_pyston ext_cpython $(NINJAFLAGS)
-	ln -sf $(CMAKE_DIR_DBG_GCC)/pyston pyston_gcc
+	$(NINJA) -C $(CMAKE_DIR_GCC) pyston copy_stdlib copy_libpyston $(CMAKE_SHAREDMODS) ext_cpython $(NINJAFLAGS)
+	ln -sf $(CMAKE_DIR_GCC)/pyston pyston_gcc
+
+CMAKE_SETUP_RELEASE_GCC := $(CMAKE_DIR_RELEASE_GCC)/build.ninja
+$(CMAKE_SETUP_RELEASE_GCC):
+	@$(MAKE) cmake_check
+	@mkdir -p $(CMAKE_DIR_RELEASE_GCC)
+	cd $(CMAKE_DIR_RELEASE_GCC); CC='$(GCC)' CXX='$(GPP)' cmake -GNinja $(SRC_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_VALGRIND)
+.PHONY: pyston_release_gcc
+pyston_release_gcc: $(CMAKE_SETUP_RELEASE_GCC)
+	$(NINJA) -C $(CMAKE_DIR_RELEASE_GCC) pyston copy_stdlib copy_libpyston $(CMAKE_SHAREDMODS) ext_cpython $(NINJAFLAGS)
+	ln -sf $(CMAKE_DIR_RELEASE_GCC)/pyston pyston_release_gcc
 
 .PHONY: format check_format
 format: $(CMAKE_SETUP_RELEASE)
@@ -952,7 +963,7 @@ $(eval \
 check$1 test$1: $(PYTHON_EXE_DEPS) pyston$1
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-S -k $(TESTS_DIR) $(ARGS)
 	@# we pass -I to cpython tests and skip failing ones because they are sloooow otherwise
-	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-S -k --exit-code-only --skip-failing -t30 $(TEST_DIR)/cpython $(ARGS)
+	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-S -k --exit-code-only --skip-failing -t50 $(TEST_DIR)/cpython $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t600 $(TEST_DIR)/integration $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -a=-x -R pyston$1 -j$(TEST_THREADS) -a=-n -a=-S -k $(TESTS_DIR) $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-O -a=-S -k $(TESTS_DIR) $(ARGS)
@@ -1017,11 +1028,12 @@ $(call make_target,_release)
 # $(call make_target,_nosync)
 $(call make_target,_prof)
 $(call make_target,_gcc)
+$(call make_target,_release_gcc)
 
 nosearch_runpy_% nosearch_pyrun_%: %.py ext_python
-	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7 zsh -c 'time python $<'
+	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(CPYTHON) $<'
 nosearch_pypyrun_%: %.py ext_python
-	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7 zsh -c 'time $(PYPY) $<'
+	$(VERB) PYTHONPATH=test/test_extension/build/lib.linux-x86_64-2.7:$${PYTHONPATH} zsh -c 'time $(PYPY) $<'
 $(call make_search,runpy_%)
 $(call make_search,pyrun_%)
 $(call make_search,pypyrun_%)
@@ -1190,7 +1202,7 @@ $(wordlist 2,9999,$(SHAREDMODS_OBJS)): $(firstword $(SHAREDMODS_OBJS))
 
 .PHONY: ext_python ext_pythondbg
 ext_python: $(TEST_EXT_MODULE_SRCS)
-	cd $(TEST_DIR)/test_extension; python setup.py build
+	cd $(TEST_DIR)/test_extension; $(CPYTHON) setup.py build
 ext_pythondbg: $(TEST_EXT_MODULE_SRCS)
 	cd $(TEST_DIR)/test_extension; python2.7-dbg setup.py build
 

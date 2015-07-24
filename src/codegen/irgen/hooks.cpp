@@ -45,7 +45,8 @@
 namespace pyston {
 
 // TODO terrible place for these!
-ParamNames::ParamNames(AST* ast, InternedStringPool& pool) : takes_param_names(true) {
+ParamNames::ParamNames(AST* ast, InternedStringPool& pool)
+    : takes_param_names(true), vararg_name(NULL), kwarg_name(NULL) {
     if (ast->type == AST_TYPE::Module || ast->type == AST_TYPE::ClassDef || ast->type == AST_TYPE::Expression
         || ast->type == AST_TYPE::Suite) {
         kwarg = "";
@@ -56,22 +57,30 @@ ParamNames::ParamNames(AST* ast, InternedStringPool& pool) : takes_param_names(t
         for (int i = 0; i < arguments->args.size(); i++) {
             AST_expr* arg = arguments->args[i];
             if (arg->type == AST_TYPE::Name) {
-                args.push_back(ast_cast<AST_Name>(arg)->id.s());
+                AST_Name* name = ast_cast<AST_Name>(arg);
+                arg_names.push_back(name);
+                args.push_back(name->id.s());
             } else {
                 InternedString dot_arg_name = pool.get("." + std::to_string(i));
+                arg_names.push_back(new AST_Name(dot_arg_name, AST_TYPE::Param, arg->lineno, arg->col_offset));
                 args.push_back(dot_arg_name.s());
             }
         }
 
         vararg = arguments->vararg.s();
+        if (vararg.size())
+            vararg_name = new AST_Name(pool.get(vararg), AST_TYPE::Param, arguments->lineno, arguments->col_offset);
+
         kwarg = arguments->kwarg.s();
+        if (kwarg.size())
+            kwarg_name = new AST_Name(pool.get(kwarg), AST_TYPE::Param, arguments->lineno, arguments->col_offset);
     } else {
         RELEASE_ASSERT(0, "%d", ast->type);
     }
 }
 
 ParamNames::ParamNames(const std::vector<llvm::StringRef>& args, llvm::StringRef vararg, llvm::StringRef kwarg)
-    : takes_param_names(true) {
+    : takes_param_names(true), vararg_name(NULL), kwarg_name(NULL) {
     this->args = args;
     this->vararg = vararg;
     this->kwarg = kwarg;
@@ -283,9 +292,13 @@ void compileAndRunModule(AST_Module* m, BoxedModule* bm) {
         ScopingAnalysis* scoping = new ScopingAnalysis(m, true);
 
         std::unique_ptr<SourceInfo> si(new SourceInfo(bm, scoping, future_flags, m, m->body, fn));
-        bm->setattr("__doc__", si->getDocString(), NULL);
-        if (!bm->hasattr("__builtins__"))
-            bm->giveAttr("__builtins__", PyModule_GetDict(builtins_module));
+
+        static BoxedString* doc_str = internStringImmortal("__doc__");
+        bm->setattr(doc_str, si->getDocString(), NULL);
+
+        static BoxedString* builtins_str = internStringImmortal("__builtins__");
+        if (!bm->hasattr(builtins_str))
+            bm->giveAttr(builtins_str, PyModule_GetDict(builtins_module));
 
         clfunc = new CLFunction(0, 0, false, false, std::move(si));
     }
@@ -302,7 +315,7 @@ Box* evalOrExec(CLFunction* cl, Box* globals, Box* boxedLocals) {
 
     Box* doc_string = cl->source->getDocString();
     if (doc_string != None) {
-        static BoxedString* doc_box = static_cast<BoxedString*>(PyString_InternFromString("__doc__"));
+        static BoxedString* doc_box = internStringImmortal("__doc__");
         setGlobal(boxedLocals, doc_box, doc_string);
     }
 
@@ -670,6 +683,7 @@ void CompiledFunction::speculationFailed() {
 
         CLFunction* cl = this->clfunc;
         assert(cl);
+        assert(this != cl->always_use_version);
 
         bool found = false;
         for (int i = 0; i < clfunc->versions.size(); i++) {
@@ -678,6 +692,17 @@ void CompiledFunction::speculationFailed() {
                 this->dependent_callsites.invalidateAll();
                 found = true;
                 break;
+            }
+        }
+
+        if (!found) {
+            for (auto it = clfunc->osr_versions.begin(); it != clfunc->osr_versions.end(); ++it) {
+                if (it->second == this) {
+                    clfunc->osr_versions.erase(it);
+                    this->dependent_callsites.invalidateAll();
+                    found = true;
+                    break;
+                }
             }
         }
 

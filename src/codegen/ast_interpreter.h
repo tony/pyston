@@ -35,19 +35,18 @@ struct LineInfo;
 extern const void* interpreter_instr_addr;
 
 struct ASTInterpreterJitInterface {
+    static int getBoxedLocalsOffset();
     static int getCurrentBlockOffset();
     static int getCurrentInstOffset();
+    static int getGeneratorOffset();
+    static int getGlobalsOffset();
 
     static Box* derefHelper(void* interp, InternedString s);
     static Box* doOSRHelper(void* interp, AST_Jump* node);
-    static Box* getBoxedLocalHelper(void* interp, BoxedString* s);
-    static Box* getBoxedLocalsHelper(void* interp);
     static Box* getLocalHelper(void* interp, InternedString id);
     static Box* landingpadHelper(void* interp);
     static Box* setExcInfoHelper(void* interp, Box* type, Box* value, Box* traceback);
     static Box* uncacheExcInfoHelper(void* interp);
-    static Box* yieldHelper(void* interp, Box* val);
-    static void setItemNameHelper(void* interp, Box* str, Box* val);
     static void setLocalClosureHelper(void* interp, InternedString id, Box* v);
     static void setLocalHelper(void* interp, InternedString id, Box* v);
 };
@@ -75,8 +74,8 @@ void setupInterpreter();
 Box* astInterpretFunction(CLFunction* f, int nargs, Box* closure, Box* generator, Box* globals, Box* arg1, Box* arg2,
                           Box* arg3, Box** args);
 Box* astInterpretFunctionEval(CLFunction* cf, Box* globals, Box* boxedLocals);
-Box* astInterpretFrom(CLFunction* cf, AST_expr* after_expr, AST_stmt* enclosing_stmt, Box* expr_val,
-                      FrameStackState frame_state);
+Box* astInterpretDeopt(CLFunction* cf, AST_expr* after_expr, AST_stmt* enclosing_stmt, Box* expr_val,
+                       FrameStackState frame_state);
 
 AST_stmt* getCurrentStatementForInterpretedFrame(void* frame_ptr);
 Box* getGlobalsForInterpretedFrame(void* frame_ptr);

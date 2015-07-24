@@ -57,13 +57,10 @@ BoxedString* EmptyString;
 BoxedString* characters[UCHAR_MAX + 1];
 
 BoxedString::BoxedString(const char* s, size_t n) : interned_state(SSTATE_NOT_INTERNED) {
+    assert(s);
     RELEASE_ASSERT(n != llvm::StringRef::npos, "");
-    if (s) {
-        memmove(data(), s, n);
-        data()[n] = 0;
-    } else {
-        memset(data(), 0, n + 1);
-    }
+    memmove(data(), s, n);
+    data()[n] = 0;
 }
 
 BoxedString::BoxedString(llvm::StringRef lhs, llvm::StringRef rhs) : interned_state(SSTATE_NOT_INTERNED) {
@@ -82,6 +79,13 @@ BoxedString::BoxedString(llvm::StringRef s) : interned_state(SSTATE_NOT_INTERNED
 BoxedString::BoxedString(size_t n, char c) : interned_state(SSTATE_NOT_INTERNED) {
     RELEASE_ASSERT(n != llvm::StringRef::npos, "");
     memset(data(), c, n);
+    data()[n] = 0;
+}
+
+BoxedString::BoxedString(size_t n) : interned_state(SSTATE_NOT_INTERNED) {
+    RELEASE_ASSERT(n != llvm::StringRef::npos, "");
+    // Note: no memset.  add the null-terminator for good measure though
+    // (CPython does the same thing).
     data()[n] = 0;
 }
 
@@ -348,16 +352,20 @@ extern "C" Box* strAdd(BoxedString* lhs, Box* _rhs) {
     return new (lhs->size() + rhs->size()) BoxedString(lhs->s(), rhs->s());
 }
 
-static llvm::StringMap<Box*> interned_strings;
+static llvm::StringMap<BoxedString*> interned_strings;
 static StatCounter num_interned_strings("num_interned_string");
 extern "C" PyObject* PyString_InternFromString(const char* s) noexcept {
     RELEASE_ASSERT(s, "");
+    return internStringImmortal(s);
+}
+
+BoxedString* internStringImmortal(llvm::StringRef s) {
     auto& entry = interned_strings[s];
     if (!entry) {
         num_interned_strings.log();
-        entry = PyGC_AddRoot(boxString(s));
+        entry = (BoxedString*)PyGC_AddRoot(boxString(s));
         // CPython returns mortal but in our current implementation they are inmortal
-        ((BoxedString*)entry)->interned_state = SSTATE_INTERNED_IMMORTAL;
+        entry->interned_state = SSTATE_INTERNED_IMMORTAL;
     }
     return entry;
 }
@@ -379,7 +387,7 @@ extern "C" void PyString_InternInPlace(PyObject** p) noexcept {
         *p = entry;
     else {
         num_interned_strings.log();
-        entry = PyGC_AddRoot(s);
+        entry = (BoxedString*)PyGC_AddRoot(s);
 
         // CPython returns mortal but in our current implementation they are inmortal
         s->interned_state = SSTATE_INTERNED_IMMORTAL;
@@ -1577,13 +1585,36 @@ Box* _strSlice(BoxedString* self, i64 start, i64 stop, i64 step, i64 length) {
         assert(start < s.size());
         assert(-1 <= stop);
     }
+    assert(length >= 0);
 
     if (length == 0)
         return EmptyString;
 
-    BoxedString* bs = new (length) BoxedString(nullptr, length);
+    BoxedString* bs = BoxedString::createUninitializedString(length);
     copySlice(bs->data(), s.data(), start, step, length);
     return bs;
+}
+
+static Box* str_slice(Box* o, Py_ssize_t i, Py_ssize_t j) {
+    BoxedString* a = static_cast<BoxedString*>(o);
+    if (i < 0)
+        i = 0;
+    if (j < 0)
+        j = 0; /* Avoid signed/unsigned bug in next line */
+    if (j > Py_SIZE(a))
+        j = Py_SIZE(a);
+    if (i == 0 && j == Py_SIZE(a) && PyString_CheckExact(a)) {
+        /* It's the same as a */
+        Py_INCREF(a);
+        return (PyObject*)a;
+    }
+    if (j < i)
+        j = i;
+    return PyString_FromStringAndSize(a->data() + i, j - i);
+}
+
+static Py_ssize_t str_length(Box* a) {
+    return Py_SIZE(a);
 }
 
 Box* strIsAlpha(BoxedString* self) {
@@ -1796,7 +1827,7 @@ extern "C" PyObject* _do_string_format(PyObject* self, PyObject* args, PyObject*
 
 Box* strFormat(BoxedString* self, BoxedTuple* args, BoxedDict* kwargs) {
     assert(args->cls == tuple_cls);
-    assert(kwargs->cls == dict_cls);
+    assert(!kwargs || kwargs->cls == dict_cls);
 
     Box* rtn = _do_string_format(self, args, kwargs);
     checkAndThrowCAPIException();
@@ -2219,6 +2250,18 @@ extern "C" Box* strGetitem(BoxedString* self, Box* slice) {
     }
 }
 
+extern "C" Box* strGetslice(BoxedString* self, Box* boxedStart, Box* boxedStop) {
+    assert(isSubclass(self->cls, str_cls));
+
+    i64 start, stop;
+    sliceIndex(boxedStart, &start);
+    sliceIndex(boxedStop, &stop);
+
+    boundSliceWithLength(&start, &stop, start, stop, self->s().size());
+
+    return _strSlice(self, start, stop, 1, stop - start);
+}
+
 
 // TODO it looks like strings don't have their own iterators, but instead
 // rely on the sequence iteration protocol.
@@ -2307,17 +2350,9 @@ extern "C" int PyString_AsStringAndSize(register PyObject* obj, register char** 
     return 0;
 }
 
-BoxedString* createUninitializedString(ssize_t n) {
-    return new (n) BoxedString(n, 0);
-}
-
-char* getWriteableStringContents(BoxedString* s) {
-    return s->data();
-}
-
 extern "C" PyObject* PyString_FromStringAndSize(const char* s, ssize_t n) noexcept {
     if (s == NULL)
-        return createUninitializedString(n);
+        return BoxedString::createUninitializedString(n);
     return boxString(llvm::StringRef(s, n));
 }
 
@@ -2334,7 +2369,7 @@ extern "C" char* PyString_AsString(PyObject* o) noexcept {
         return string_getbuffer(o);
 
     BoxedString* s = static_cast<BoxedString*>(o);
-    return getWriteableStringContents(s);
+    return s->getWriteableStringContents();
 }
 
 extern "C" Py_ssize_t PyString_Size(PyObject* op) noexcept {
@@ -2636,7 +2671,7 @@ static PyBufferProcs string_as_buffer = {
 };
 
 static PyMethodDef string_methods[] = {
-    { "count", (PyCFunction)string_count, METH_VARARGS, NULL },
+    { "count", (PyCFunction)string_count, METH_O3 | METH_D2, NULL },
     { "join", (PyCFunction)string_join, METH_O, NULL },
     { "split", (PyCFunction)string_split, METH_VARARGS, NULL },
     { "rsplit", (PyCFunction)string_rsplit, METH_VARARGS, NULL },
@@ -2733,6 +2768,8 @@ void setupStr() {
 
     str_cls->giveAttr("__getitem__", new BoxedFunction(boxRTFunction((void*)strGetitem, STR, 2)));
 
+    str_cls->giveAttr("__getslice__", new BoxedFunction(boxRTFunction((void*)strGetslice, STR, 3)));
+
     str_cls->giveAttr("__iter__", new BoxedFunction(boxRTFunction((void*)strIter, typeFromClass(str_iterator_cls), 1)));
 
     str_cls->giveAttr("replace",
@@ -2747,6 +2784,9 @@ void setupStr() {
 
     add_operators(str_cls);
     str_cls->freeze();
+
+    str_cls->tp_as_sequence->sq_slice = str_slice;
+    str_cls->tp_as_sequence->sq_length = str_length;
 
     basestring_cls->giveAttr("__doc__",
                              boxString("Type basestring cannot be instantiated; it is the base for str and unicode."));

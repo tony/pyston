@@ -887,7 +887,6 @@ void Assembler::jmp(JumpDestination dest) {
         emitByte(0xeb);
         emitByte(offset);
     } else {
-        assert((-1L << 31) <= dest.offset && dest.offset < (1L << 31) - 1);
         offset -= 3;
         emitByte(0xe9);
         emitInt(offset, 4);
@@ -1032,6 +1031,16 @@ void Assembler::emitAnnotation(int num) {
     nop();
     cmp(RAX, Immediate(num));
     nop();
+}
+
+void Assembler::skipBytes(int num) {
+    if (addr + num >= end_addr) {
+        addr = end_addr;
+        failed = true;
+        return;
+    }
+
+    addr += num;
 }
 
 ForwardJump::ForwardJump(Assembler& assembler, ConditionCode condition)

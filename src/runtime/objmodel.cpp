@@ -59,24 +59,15 @@
 
 namespace pyston {
 
-static const std::string all_str("__all__");
-static const std::string call_str("__call__");
-static const std::string delattr_str("__delattr__");
-static const std::string delete_str("__delete__");
 static const std::string delitem_str("__delitem__");
 static const std::string getattribute_str("__getattribute__");
 static const std::string getattr_str("__getattr__");
-static const std::string getitem_str("__getitem__");
-static const std::string get_str("__get__");
-static const std::string hasnext_str("__hasnext__");
 static const std::string init_str("__init__");
 static const std::string iter_str("__iter__");
 static const std::string new_str("__new__");
 static const std::string none_str("None");
 static const std::string repr_str("__repr__");
-static const std::string setattr_str("__setattr__");
 static const std::string setitem_str("__setitem__");
-static const std::string set_str("__set__");
 static const std::string str_str("__str__");
 
 #if 0
@@ -86,14 +77,20 @@ void REWRITE_ABORTED(const char* reason) {
 #define REWRITE_ABORTED(reason) ((void)(reason))
 #endif
 
-static Box* (*runtimeCallInternal0)(Box*, CallRewriteArgs*, ArgPassSpec)
-    = (Box * (*)(Box*, CallRewriteArgs*, ArgPassSpec))runtimeCallInternal;
-static Box* (*runtimeCallInternal1)(Box*, CallRewriteArgs*, ArgPassSpec, Box*)
-    = (Box * (*)(Box*, CallRewriteArgs*, ArgPassSpec, Box*))runtimeCallInternal;
-static Box* (*runtimeCallInternal2)(Box*, CallRewriteArgs*, ArgPassSpec, Box*, Box*)
-    = (Box * (*)(Box*, CallRewriteArgs*, ArgPassSpec, Box*, Box*))runtimeCallInternal;
-static Box* (*runtimeCallInternal3)(Box*, CallRewriteArgs*, ArgPassSpec, Box*, Box*, Box*)
-    = (Box * (*)(Box*, CallRewriteArgs*, ArgPassSpec, Box*, Box*, Box*))runtimeCallInternal;
+static inline Box* runtimeCallInternal0(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec argspec) {
+    return runtimeCallInternal(obj, rewrite_args, argspec, NULL, NULL, NULL, NULL, NULL);
+}
+static inline Box* runtimeCallInternal1(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Box* arg1) {
+    return runtimeCallInternal(obj, rewrite_args, argspec, arg1, NULL, NULL, NULL, NULL);
+}
+static inline Box* runtimeCallInternal2(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Box* arg1,
+                                        Box* arg2) {
+    return runtimeCallInternal(obj, rewrite_args, argspec, arg1, arg2, NULL, NULL, NULL);
+}
+static inline Box* runtimeCallInternal3(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Box* arg1,
+                                        Box* arg2, Box* arg3) {
+    return runtimeCallInternal(obj, rewrite_args, argspec, arg1, arg2, arg3, NULL, NULL);
+}
 
 bool checkClass(LookupScope scope) {
     return (scope & CLASS_ONLY) != 0;
@@ -101,14 +98,23 @@ bool checkClass(LookupScope scope) {
 bool checkInst(LookupScope scope) {
     return (scope & INST_ONLY) != 0;
 }
-static Box* (*callattrInternal0)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec)
-    = (Box * (*)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec))callattrInternal;
-static Box* (*callattrInternal1)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*)
-    = (Box * (*)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*))callattrInternal;
-static Box* (*callattrInternal2)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*, Box*)
-    = (Box * (*)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*, Box*))callattrInternal;
-static Box* (*callattrInternal3)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*, Box*, Box*)
-    = (Box * (*)(Box*, BoxedString*, LookupScope, CallRewriteArgs*, ArgPassSpec, Box*, Box*, Box*))callattrInternal;
+
+static inline Box* callattrInternal0(Box* obj, BoxedString* attr, LookupScope scope, CallRewriteArgs* rewrite_args,
+                                     ArgPassSpec argspec) {
+    return callattrInternal(obj, attr, scope, rewrite_args, argspec, NULL, NULL, NULL, NULL, NULL);
+}
+static inline Box* callattrInternal1(Box* obj, BoxedString* attr, LookupScope scope, CallRewriteArgs* rewrite_args,
+                                     ArgPassSpec argspec, Box* arg1) {
+    return callattrInternal(obj, attr, scope, rewrite_args, argspec, arg1, NULL, NULL, NULL, NULL);
+}
+static inline Box* callattrInternal2(Box* obj, BoxedString* attr, LookupScope scope, CallRewriteArgs* rewrite_args,
+                                     ArgPassSpec argspec, Box* arg1, Box* arg2) {
+    return callattrInternal(obj, attr, scope, rewrite_args, argspec, arg1, arg2, NULL, NULL, NULL);
+}
+static inline Box* callattrInternal3(Box* obj, BoxedString* attr, LookupScope scope, CallRewriteArgs* rewrite_args,
+                                     ArgPassSpec argspec, Box* arg1, Box* arg2, Box* arg3) {
+    return callattrInternal(obj, attr, scope, rewrite_args, argspec, arg1, arg2, arg3, NULL, NULL);
+}
 
 #if STAT_TIMERS
 static uint64_t* pyhasher_timer_counter = Stats::getStatCounter("us_timer_PyHasher");
@@ -151,16 +157,10 @@ bool PyLt::operator()(Box* lhs, Box* rhs) const {
 }
 
 extern "C" Box* deopt(AST_expr* expr, Box* value) {
+    STAT_TIMER(t0, "us_timer_deopt", 10);
+
     static StatCounter num_deopt("num_deopt");
     num_deopt.log();
-
-    printf("Deopt!\n");
-    print_ast(expr);
-    printf("\n");
-    dump(value);
-    printf("\n");
-
-    RELEASE_ASSERT(0, "deopt is currently broken...");
 
     auto deopt_state = getDeoptState();
 
@@ -174,7 +174,7 @@ extern "C" Box* deopt(AST_expr* expr, Box* value) {
         deopt_state.frame_state.frame_info->exc.value = NULL;
     }
 
-    return astInterpretFrom(deopt_state.cf->clfunc, expr, deopt_state.current_stmt, value, deopt_state.frame_state);
+    return astInterpretDeopt(deopt_state.cf->clfunc, expr, deopt_state.current_stmt, value, deopt_state.frame_state);
 }
 
 extern "C" bool softspace(Box* b, bool newval) {
@@ -191,7 +191,7 @@ extern "C" bool softspace(Box* b, bool newval) {
         return (bool)r;
     }
 
-    static BoxedString* softspace_str = static_cast<BoxedString*>(PyString_InternFromString("softspace"));
+    static BoxedString* softspace_str = internStringImmortal("softspace");
 
     bool r;
     Box* gotten = NULL;
@@ -216,9 +216,9 @@ extern "C" bool softspace(Box* b, bool newval) {
 }
 
 extern "C" void printHelper(Box* dest, Box* var, bool nl) {
-    static BoxedString* write_str = static_cast<BoxedString*>(PyString_InternFromString("write"));
-    static BoxedString* newline_str = static_cast<BoxedString*>(PyString_InternFromString("\n"));
-    static BoxedString* space_str = static_cast<BoxedString*>(PyString_InternFromString(" "));
+    static BoxedString* write_str = internStringImmortal("write");
+    static BoxedString* newline_str = internStringImmortal("\n");
+    static BoxedString* space_str = internStringImmortal(" ");
 
     if (var) {
         // begin code for handling of softspace
@@ -331,6 +331,63 @@ extern "C" Box** unpackIntoArray(Box* obj, int64_t expected_size) {
     return &elts[0];
 }
 
+void dealloc_null(Box* box) {
+    assert(box->cls->tp_del == NULL);
+}
+
+// Analoguous to CPython's implementation of subtype_dealloc, but having a GC
+// saves us from complications involving "trashcan macros".
+//
+// This is the default destructor assigned to the tp_dealloc slot, the C/C++
+// implementation of a Python object destructor. It may call the Python-implemented
+// destructor __del__ stored in tp_del, if any.
+//
+// For now, we treat tp_del and tp_dealloc as one unit. In theory, we will only
+// have both if we have a Python class with a __del__ method that subclasses from
+// a C extension with a non-trivial tp_dealloc. We assert on that case for now
+// until we run into actual code with this fairly rare situation.
+//
+// This case (having both tp_del and tp_dealloc) shouldn't be a problem if we
+// remove the assert, except in the exceptional case where the __del__ method
+// does object resurrection. The fix for this would be to spread out tp_del,
+// tp_dealloc and sweeping over 3 GC passes. This would slightly impact the
+// performance of Pyston as a whole for a case that may not exist in any
+// production code, so we decide not to handle that edge case for now.
+static void subtype_dealloc(Box* self) {
+    BoxedClass* type = self->cls;
+
+    if (type->tp_del) {
+        type->tp_del(self);
+    }
+
+    // Find nearest base with a different tp_dealloc.
+    BoxedClass* base = type;
+    while (base && base->tp_dealloc == subtype_dealloc) {
+        base = base->tp_base;
+    }
+
+    if (base && base->tp_dealloc && base->tp_dealloc != dealloc_null) {
+        RELEASE_ASSERT(!type->tp_del, "having both a tp_del and tp_dealloc not supported");
+        base->tp_dealloc(self);
+    }
+}
+
+// We don't need CPython's version of tp_free since we have GC.
+// We still need to set tp_free to something and not a NULL pointer,
+// because C extensions might still call tp_free from tp_dealloc.
+void default_free(void*) {
+}
+
+bool BoxedClass::hasNonDefaultTpDealloc() {
+    // Find nearest base with a different tp_dealloc.
+    BoxedClass* base = this;
+    while (base && base->tp_dealloc == subtype_dealloc) {
+        base = base->tp_base;
+    }
+
+    return base && base->tp_dealloc && base->tp_dealloc != dealloc_null;
+}
+
 void BoxedClass::freeze() {
     assert(!is_constant);
     assert(tp_name); // otherwise debugging will be very hard
@@ -339,7 +396,7 @@ void BoxedClass::freeze() {
 
     if (instancesHaveDictAttrs() || instancesHaveHCAttrs())
         ASSERT(this == closure_cls || this == classobj_cls || this == instance_cls
-                   || typeLookup(this, "__dict__", NULL),
+                   || typeLookup(this, internStringMortal("__dict__"), NULL),
                "%s", tp_name);
 
     is_constant = true;
@@ -349,11 +406,12 @@ BoxedClass::BoxedClass(BoxedClass* base, gcvisit_func gc_visit, int attrs_offset
                        int instance_size, bool is_user_defined)
     : attrs(HiddenClass::makeSingleton()),
       gc_visit(gc_visit),
-      simple_destructor(NULL),
       attrs_offset(attrs_offset),
       is_constant(false),
       is_user_defined(is_user_defined),
-      is_pyston_class(true) {
+      is_pyston_class(true),
+      has___class__(false),
+      has_instancecheck(false) {
 
     // Zero out the CPython tp_* slots:
     memset(&tp_name, 0, (char*)(&tp_version_tag + 1) - (char*)(&tp_name));
@@ -387,7 +445,21 @@ BoxedClass::BoxedClass(BoxedClass* base, gcvisit_func gc_visit, int attrs_offset
         assert(cls == type_cls || isSubclass(cls, type_cls));
     }
 
-    assert(tp_dealloc == NULL);
+    if (is_user_defined) {
+        tp_dealloc = subtype_dealloc;
+    } else {
+        // We don't want default types like dict to have subtype_dealloc as a destructor.
+        // In CPython, they would have their custom tp_dealloc, except that we don't
+        // need them in Pyston due to GC.
+        //
+        // What's the problem with having subtype_dealloc? In some cases like defdict_dealloc,
+        // the destructor calls another destructor thinking it's the parent, but ends up in the
+        // same destructor again (since child destructors are found first by subtype_dealloc)
+        // causing an infinite recursion loop.
+        tp_dealloc = dealloc_null;
+        has_safe_tp_dealloc = true;
+    }
+    tp_free = default_free;
 
     if (gc_visit == NULL) {
         assert(base);
@@ -482,7 +554,8 @@ BoxedHeapClass* BoxedHeapClass::create(BoxedClass* metaclass, BoxedClass* base, 
 }
 
 std::string getFullNameOfClass(BoxedClass* cls) {
-    Box* b = cls->getattr("__module__");
+    static BoxedString* module_str = internStringImmortal("__module__");
+    Box* b = cls->getattr(module_str);
     if (!b)
         return cls->tp_name;
     assert(b);
@@ -506,7 +579,8 @@ const char* getNameOfClass(BoxedClass* cls) {
     return cls->tp_name;
 }
 
-void HiddenClass::appendAttribute(llvm::StringRef attr) {
+void HiddenClass::appendAttribute(BoxedString* attr) {
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
     assert(type == SINGLETON);
     dependent_getattrs.invalidateAll();
     assert(attr_offsets.count(attr) == 0);
@@ -521,7 +595,8 @@ void HiddenClass::appendAttrwrapper() {
     attrwrapper_offset = this->attributeArraySize();
 }
 
-void HiddenClass::delAttribute(llvm::StringRef attr) {
+void HiddenClass::delAttribute(BoxedString* attr) {
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
     assert(type == SINGLETON);
     dependent_getattrs.invalidateAll();
     assert(attr_offsets.count(attr));
@@ -543,8 +618,10 @@ void HiddenClass::addDependence(Rewriter* rewriter) {
     rewriter->addDependenceOn(dependent_getattrs);
 }
 
-HiddenClass* HiddenClass::getOrMakeChild(llvm::StringRef attr) {
+HiddenClass* HiddenClass::getOrMakeChild(BoxedString* attr) {
     STAT_TIMER(t0, "us_timer_hiddenclass_getOrMakeChild", 0);
+
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
     assert(type == NORMAL);
 
     auto it = children.find(attr);
@@ -555,8 +632,8 @@ HiddenClass* HiddenClass::getOrMakeChild(llvm::StringRef attr) {
     num_hclses.log();
 
     HiddenClass* rtn = new HiddenClass(this);
-    this->children[attr] = rtn;
     rtn->attr_offsets[attr] = this->attributeArraySize();
+    this->children[attr] = rtn;
     assert(rtn->attributeArraySize() == this->attributeArraySize() + 1);
     return rtn;
 }
@@ -566,9 +643,10 @@ HiddenClass* HiddenClass::getAttrwrapperChild() {
     assert(attrwrapper_offset == -1);
 
     if (!attrwrapper_child) {
-        attrwrapper_child = new HiddenClass(this);
-        attrwrapper_child->attrwrapper_offset = this->attributeArraySize();
-        assert(attrwrapper_child->attributeArraySize() == this->attributeArraySize() + 1);
+        HiddenClass* made = new HiddenClass(this);
+        made->attrwrapper_offset = this->attributeArraySize();
+        this->attrwrapper_child = made;
+        assert(made->attributeArraySize() == this->attributeArraySize() + 1);
     }
 
     return attrwrapper_child;
@@ -577,19 +655,20 @@ HiddenClass* HiddenClass::getAttrwrapperChild() {
 /**
  * del attr from current HiddenClass, maintaining the order of the remaining attrs
  */
-HiddenClass* HiddenClass::delAttrToMakeHC(llvm::StringRef attr) {
+HiddenClass* HiddenClass::delAttrToMakeHC(BoxedString* attr) {
     STAT_TIMER(t0, "us_timer_hiddenclass_delAttrToMakeHC", 0);
 
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
     assert(type == NORMAL);
     int idx = getOffset(attr);
     assert(idx >= 0);
 
-    std::vector<std::string> new_attrs(attributeArraySize() - 1);
+    std::vector<BoxedString*> new_attrs(attributeArraySize() - 1);
     for (auto it = attr_offsets.begin(); it != attr_offsets.end(); ++it) {
         if (it->second < idx)
-            new_attrs[it->second] = it->first();
+            new_attrs[it->second] = it->first;
         else if (it->second > idx) {
-            new_attrs[it->second - 1] = it->first();
+            new_attrs[it->second - 1] = it->first;
         }
     }
 
@@ -666,9 +745,17 @@ BoxedDict* Box::getDict() {
 }
 
 static StatCounter box_getattr_slowpath("slowpath_box_getattr");
-Box* Box::getattr(llvm::StringRef attr, GetattrRewriteArgs* rewrite_args) {
+Box* Box::getattr(BoxedString* attr, GetattrRewriteArgs* rewrite_args) {
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
 
-    if (rewrite_args)
+    // We have to guard on the class in order to know the object's layout,
+    // ie to know which kinds of attributes the object has and where they
+    // live in the object's layout.
+    // TODO we could try guarding on those fields directly rather than on
+    // the class itself (which implies all of them).  That might require
+    // creating a single field that encompasses the relevant other fields
+    // so that it can still be a single guard rather than multiple.
+    if (rewrite_args && !rewrite_args->obj_shape_guarded)
         rewrite_args->obj->addAttrGuard(offsetof(Box, cls), (intptr_t)cls);
 
 #if 0
@@ -698,27 +785,30 @@ Box* Box::getattr(llvm::StringRef attr, GetattrRewriteArgs* rewrite_args) {
         HCAttrs* attrs = getHCAttrsPtr();
         HiddenClass* hcls = attrs->hcls;
 
-        if (hcls->type == HiddenClass::DICT_BACKED) {
+        if (unlikely(hcls->type == HiddenClass::DICT_BACKED)) {
             if (rewrite_args)
                 assert(!rewrite_args->out_success);
             rewrite_args = NULL;
             Box* d = attrs->attr_list->attrs[0];
             assert(d);
-            assert(attr.data()[attr.size()] == '\0');
-            Box* r = PyDict_GetItemString(d, attr.data());
+            assert(attr->data()[attr->size()] == '\0');
+            Box* r = PyDict_GetItem(d, attr);
             // r can be NULL if the item didn't exist
             return r;
         }
 
         assert(hcls->type == HiddenClass::NORMAL || hcls->type == HiddenClass::SINGLETON);
 
-        if (rewrite_args) {
+        if (unlikely(rewrite_args)) {
             if (!rewrite_args->obj_hcls_guarded) {
                 if (cls->attrs_offset < 0) {
                     REWRITE_ABORTED("");
                     rewrite_args = NULL;
                 } else {
-                    rewrite_args->obj->addAttrGuard(cls->attrs_offset + offsetof(HCAttrs, hcls), (intptr_t)hcls);
+                    if (!(rewrite_args->obj->isConstant() && cls == type_cls
+                          && static_cast<BoxedClass*>(this)->is_constant)) {
+                        rewrite_args->obj->addAttrGuard(cls->attrs_offset + offsetof(HCAttrs, hcls), (intptr_t)hcls);
+                    }
                     if (hcls->type == HiddenClass::SINGLETON)
                         hcls->addDependence(rewrite_args->rewriter);
                 }
@@ -759,8 +849,7 @@ Box* Box::getattr(llvm::StringRef attr, GetattrRewriteArgs* rewrite_args) {
 
         BoxedDict* d = getDict();
 
-        Box* key = boxString(attr);
-        auto it = d->d.find(key);
+        auto it = d->d.find(attr);
         if (it == d->d.end()) {
             return NULL;
         }
@@ -816,8 +905,9 @@ void Box::appendNewHCAttr(Box* new_attr, SetattrRewriteArgs* rewrite_args) {
     attrs->attr_list->attrs[numattrs] = new_attr;
 }
 
-void Box::setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_args) {
+void Box::setattr(BoxedString* attr, Box* val, SetattrRewriteArgs* rewrite_args) {
     assert(gc::isValidGCObject(val));
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
 
     // Have to guard on the memory layout of this object.
     // Right now, guard on the specific Python-class, which in turn
@@ -831,7 +921,7 @@ void Box::setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_ar
     if (rewrite_args)
         rewrite_args->obj->addAttrGuard(offsetof(Box, cls), (intptr_t)cls);
 
-    RELEASE_ASSERT(attr != none_str || this == builtins_module, "can't assign to None");
+    RELEASE_ASSERT(attr->s() != none_str || this == builtins_module, "can't assign to None");
 
     if (cls->instancesHaveHCAttrs()) {
         HCAttrs* attrs = getHCAttrsPtr();
@@ -843,8 +933,8 @@ void Box::setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_ar
             rewrite_args = NULL;
             Box* d = attrs->attr_list->attrs[0];
             assert(d);
-            assert(attr.data()[attr.size()] == '\0');
-            PyDict_SetItemString(d, attr.data(), val);
+            assert(attr->data()[attr->size()] == '\0');
+            PyDict_SetItem(d, attr, val);
             checkAndThrowCAPIException();
             return;
         }
@@ -922,7 +1012,7 @@ void Box::setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_ar
 
     if (cls->instancesHaveDictAttrs()) {
         BoxedDict* d = getDict();
-        d->d[boxString(attr)] = val;
+        d->d[attr] = val;
         return;
     }
 
@@ -933,14 +1023,14 @@ void Box::setattr(llvm::StringRef attr, Box* val, SetattrRewriteArgs* rewrite_ar
 extern "C" PyObject* _PyType_Lookup(PyTypeObject* type, PyObject* name) noexcept {
     RELEASE_ASSERT(name->cls == str_cls, "");
     try {
-        return typeLookup(type, static_cast<BoxedString*>(name)->s(), NULL);
+        return typeLookup(type, static_cast<BoxedString*>(name), NULL);
     } catch (ExcInfo e) {
         setCAPIException(e);
         return NULL;
     }
 }
 
-Box* typeLookup(BoxedClass* cls, llvm::StringRef attr, GetattrRewriteArgs* rewrite_args) {
+Box* typeLookup(BoxedClass* cls, BoxedString* attr, GetattrRewriteArgs* rewrite_args) {
     Box* val;
 
     if (rewrite_args) {
@@ -970,6 +1060,9 @@ Box* typeLookup(BoxedClass* cls, llvm::StringRef attr, GetattrRewriteArgs* rewri
                 assert(rewrite_args->obj == obj_saved);
             } else {
                 rewrite_args->obj = rewrite_args->rewriter->loadConst((intptr_t)base, Location::any());
+                // We are passing a constant object, and objects are not allowed to change shape
+                // (at least the kind of "shape" that Box::getattr is referring to)
+                rewrite_args->obj_shape_guarded = true;
             }
             val = base->getattr(attr, rewrite_args);
             assert(rewrite_args->out_success);
@@ -979,9 +1072,20 @@ Box* typeLookup(BoxedClass* cls, llvm::StringRef attr, GetattrRewriteArgs* rewri
 
         return NULL;
     } else {
+        assert(attr->interned_state != SSTATE_NOT_INTERNED);
+
         assert(cls->tp_mro);
         assert(cls->tp_mro->cls == tuple_cls);
         for (auto b : *static_cast<BoxedTuple*>(cls->tp_mro)) {
+            // object_cls will get checked very often, but it only
+            // has attributes that start with an underscore.
+            if (b == object_cls) {
+                if (attr->data()[0] != '_') {
+                    assert(!b->getattr(attr, NULL));
+                    continue;
+                }
+            }
+
             val = b->getattr(attr, NULL);
             if (val)
                 return val;
@@ -1182,8 +1286,8 @@ static Box* boxStringFromCharPtr(const char* s) {
     return boxString(s);
 }
 
-Box* dataDescriptorInstanceSpecialCases(GetattrRewriteArgs* rewrite_args, llvm::StringRef attr_name, Box* obj,
-                                        Box* descr, RewriterVar* r_descr, bool for_call, Box** bind_obj_out,
+Box* dataDescriptorInstanceSpecialCases(GetattrRewriteArgs* rewrite_args, BoxedString* attr_name, Box* obj, Box* descr,
+                                        RewriterVar* r_descr, bool for_call, Box** bind_obj_out,
                                         RewriterVar** r_bind_obj_out) {
     // Special case: data descriptor: member descriptor
     if (descr->cls == member_descriptor_cls) {
@@ -1217,7 +1321,7 @@ Box* dataDescriptorInstanceSpecialCases(GetattrRewriteArgs* rewrite_args, llvm::
 
                 Box* rtn = *reinterpret_cast<Box**>((char*)obj + member_desc->offset);
                 if (rtn == NULL) {
-                    raiseExcHelper(AttributeError, "%.*s", attr_name.size(), attr_name.data());
+                    raiseExcHelper(AttributeError, "%.*s", attr_name->size(), attr_name->data());
                 }
                 return rtn;
             }
@@ -1336,8 +1440,8 @@ Box* dataDescriptorInstanceSpecialCases(GetattrRewriteArgs* rewrite_args, llvm::
         // is of that type.
 
         if (getset_descr->get == NULL) {
-            raiseExcHelper(AttributeError, "attribute '%.*s' of '%s' object is not readable", attr_name.size(),
-                           attr_name.data(), getTypeName(getset_descr));
+            raiseExcHelper(AttributeError, "attribute '%.*s' of '%s' object is not readable", attr_name->size(),
+                           attr_name->data(), getTypeName(getset_descr));
         }
 
         // Abort because right now we can't call twice in a rewrite
@@ -1372,14 +1476,42 @@ Box* getattrInternalEx(Box* obj, BoxedString* attr, GetattrRewriteArgs* rewrite_
 
     if (!cls_only) {
         BoxedClass* cls = obj->cls;
+
+        // We could also use the old invalidation-based approach here:
+        if (rewrite_args)
+            rewrite_args->obj->getAttr(offsetof(Box, cls))
+                ->addAttrGuard(offsetof(BoxedClass, tp_getattro), (uint64_t)obj->cls->tp_getattro);
+
         if (obj->cls->tp_getattro && obj->cls->tp_getattro != PyObject_GenericGetAttr) {
             STAT_TIMER(t0, "us_timer_slowpath_tpgetattro", 10);
+
+            if (obj->cls->tp_getattro == slot_tp_getattr_hook) {
+                return slotTpGetattrHookInternal(obj, attr, rewrite_args);
+            }
 
             Box* r = obj->cls->tp_getattro(obj, attr);
             if (!r)
                 throwCAPIException();
+
+            // If attr is immortal, then we are free to write an embedded reference to it.
+            // Immortal are (unfortunately) common right now, so this is an easy way to get
+            // around the fact that we don't currently scan ICs for GC references, but eventually
+            // we should just add that.
+            if (rewrite_args && attr->interned_state == SSTATE_INTERNED_IMMORTAL) {
+                auto r_box = rewrite_args->rewriter->loadConst((intptr_t)attr);
+                auto r_rtn = rewrite_args->rewriter->call(true, (void*)obj->cls->tp_getattro, rewrite_args->obj, r_box);
+                rewrite_args->rewriter->call(true, (void*)checkAndThrowCAPIException);
+
+                rewrite_args->out_rtn = r_rtn;
+                rewrite_args->out_success = true;
+            }
             return r;
         }
+
+        // We could also use the old invalidation-based approach here:
+        if (rewrite_args)
+            rewrite_args->obj->getAttr(offsetof(Box, cls))
+                ->addAttrGuard(offsetof(BoxedClass, tp_getattr), (uint64_t)obj->cls->tp_getattr);
 
         if (obj->cls->tp_getattr) {
             STAT_TIMER(t0, "us_timer_slowpath_tpgetattr", 10);
@@ -1390,16 +1522,9 @@ Box* getattrInternalEx(Box* obj, BoxedString* attr, GetattrRewriteArgs* rewrite_
                 throwCAPIException();
             return r;
         }
-
-        // We could also use the old invalidation-based approach here:
-        if (rewrite_args) {
-            auto r_cls = rewrite_args->obj->getAttr(offsetof(Box, cls));
-            r_cls->addAttrGuard(offsetof(BoxedClass, tp_getattr), (uint64_t)obj->cls->tp_getattr);
-            r_cls->addAttrGuard(offsetof(BoxedClass, tp_getattro), (uint64_t)obj->cls->tp_getattro);
-        }
     }
 
-    return getattrInternalGeneric(obj, attr->s(), rewrite_args, cls_only, for_call, bind_obj_out, r_bind_obj_out);
+    return getattrInternalGeneric(obj, attr, rewrite_args, cls_only, for_call, bind_obj_out, r_bind_obj_out);
 }
 
 inline Box* getclsattrInternal(Box* obj, BoxedString* attr, GetattrRewriteArgs* rewrite_args) {
@@ -1462,8 +1587,10 @@ return gotten;
 // this function is useful for custom getattribute implementations that already know whether the descriptor
 // came from the class or not.
 Box* processDescriptorOrNull(Box* obj, Box* inst, Box* owner) {
-    if (DEBUG >= 2)
+    if (DEBUG >= 2) {
+        static BoxedString* get_str = internStringImmortal("__get__");
         assert((obj->cls->tp_descr_get == NULL) == (typeLookup(obj->cls, get_str, NULL) == NULL));
+    }
     if (obj->cls->tp_descr_get) {
         Box* r = obj->cls->tp_descr_get(obj, inst, owner);
         if (!r)
@@ -1481,13 +1608,16 @@ Box* processDescriptor(Box* obj, Box* inst, Box* owner) {
 }
 
 
-Box* getattrInternalGeneric(Box* obj, llvm::StringRef attr, GetattrRewriteArgs* rewrite_args, bool cls_only,
-                            bool for_call, Box** bind_obj_out, RewriterVar** r_bind_obj_out) {
+Box* getattrInternalGeneric(Box* obj, BoxedString* attr, GetattrRewriteArgs* rewrite_args, bool cls_only, bool for_call,
+                            Box** bind_obj_out, RewriterVar** r_bind_obj_out) {
     if (for_call) {
         *bind_obj_out = NULL;
     }
 
     assert(obj->cls != closure_cls);
+
+    static BoxedString* get_str = internStringImmortal("__get__");
+    static BoxedString* set_str = internStringImmortal("__set__");
 
     // Handle descriptor logic here.
     // A descriptor is either a data descriptor or a non-data descriptor.
@@ -1630,7 +1760,7 @@ Box* getattrInternalGeneric(Box* obj, llvm::StringRef attr, GetattrRewriteArgs* 
     }
 
     if (!cls_only) {
-        if (!isSubclass(obj->cls, type_cls)) {
+        if (!PyType_Check(obj)) {
             // Look up the val in the object's dictionary and if you find it, return it.
 
             Box* val;
@@ -1805,8 +1935,8 @@ Box* getattrInternalGeneric(Box* obj, llvm::StringRef attr, GetattrRewriteArgs* 
     // TODO this shouldn't go here; it should be in instancemethod_cls->tp_getattr[o]
     if (obj->cls == instancemethod_cls) {
         assert(!rewrite_args || !rewrite_args->out_success);
-        return getattrInternalEx(static_cast<BoxedInstanceMethod*>(obj)->func, boxString(attr), NULL, cls_only,
-                                 for_call, bind_obj_out, NULL);
+        return getattrInternalEx(static_cast<BoxedInstanceMethod*>(obj)->func, attr, NULL, cls_only, for_call,
+                                 bind_obj_out, NULL);
     }
 
     if (rewrite_args) {
@@ -1832,7 +1962,9 @@ Box* getattrMaybeNonstring(Box* obj, Box* attr) {
         }
     }
 
-    return getattr(obj, static_cast<BoxedString*>(attr));
+    BoxedString* s = static_cast<BoxedString*>(attr);
+    internStringMortalInplace(s);
+    return getattr(obj, s);
 }
 
 extern "C" Box* getattr(Box* obj, BoxedString* attr) {
@@ -1888,11 +2020,15 @@ extern "C" Box* getattr(Box* obj, BoxedString* attr) {
         GetattrRewriteArgs rewrite_args(rewriter.get(), rewriter->getArg(0), dest);
         val = getattrInternal(obj, attr, &rewrite_args);
 
-        // should make sure getattrInternal calls finishes using obj itself
-        // if it is successful
-
-        if (rewrite_args.out_success && val) {
-            if (recorder) {
+        if (rewrite_args.out_success) {
+            if (!val) {
+                if (attr->interned_state == SSTATE_INTERNED_IMMORTAL) {
+                    rewriter->call(true, (void*)raiseAttributeError, rewriter->getArg(0),
+                                   rewriter->loadConst((intptr_t)attr->data(), Location::forArg(1)),
+                                   rewriter->loadConst(attr->size(), Location::forArg(2)));
+                    rewriter->commit();
+                }
+            } else if (recorder) {
                 RewriterVar* record_rtn = rewriter->call(false, (void*)recordType,
                                                          rewriter->loadConst((intptr_t)recorder, Location::forArg(0)),
                                                          rewrite_args.out_rtn);
@@ -1915,7 +2051,7 @@ extern "C" Box* getattr(Box* obj, BoxedString* attr) {
 }
 
 bool dataDescriptorSetSpecialCases(Box* obj, Box* val, Box* descr, SetattrRewriteArgs* rewrite_args,
-                                   RewriterVar* r_descr, llvm::StringRef attr_name) {
+                                   RewriterVar* r_descr, BoxedString* attr_name) {
 
     // Special case: getset descriptor
     if (descr->cls == pyston_getset_cls || descr->cls == capi_getset_cls) {
@@ -1923,8 +2059,8 @@ bool dataDescriptorSetSpecialCases(Box* obj, Box* val, Box* descr, SetattrRewrit
 
         // TODO type checking goes here
         if (getset_descr->set == NULL) {
-            raiseExcHelper(AttributeError, "attribute '%.*s' of '%s' objects is not writable", attr_name.size(),
-                           attr_name.data(), getTypeName(obj));
+            raiseExcHelper(AttributeError, "attribute '%.*s' of '%s' objects is not writable", attr_name->size(),
+                           attr_name->data(), getTypeName(obj));
         }
 
         if (rewrite_args) {
@@ -1970,6 +2106,8 @@ void setattrGeneric(Box* obj, BoxedString* attr, Box* val, SetattrRewriteArgs* r
     assert(val);
     assert(gc::isValidGCObject(val));
 
+    static BoxedString* set_str = internStringImmortal("__set__");
+
     // TODO this should be in type_setattro
     if (obj->cls == type_cls) {
         BoxedClass* cobj = static_cast<BoxedClass*>(obj);
@@ -1987,7 +2125,7 @@ void setattrGeneric(Box* obj, BoxedString* attr, Box* val, SetattrRewriteArgs* r
     if (rewrite_args) {
         RewriterVar* r_cls = rewrite_args->obj->getAttr(offsetof(Box, cls), Location::any());
         GetattrRewriteArgs crewrite_args(rewrite_args->rewriter, r_cls, rewrite_args->rewriter->getReturnDestination());
-        descr = typeLookup(obj->cls, attr->s(), &crewrite_args);
+        descr = typeLookup(obj->cls, attr, &crewrite_args);
 
         if (!crewrite_args.out_success) {
             rewrite_args = NULL;
@@ -1995,13 +2133,13 @@ void setattrGeneric(Box* obj, BoxedString* attr, Box* val, SetattrRewriteArgs* r
             r_descr = crewrite_args.out_rtn;
         }
     } else {
-        descr = typeLookup(obj->cls, attr->s(), NULL);
+        descr = typeLookup(obj->cls, attr, NULL);
     }
 
     Box* _set_ = NULL;
     RewriterVar* r_set = NULL;
     if (descr) {
-        bool special_case_worked = dataDescriptorSetSpecialCases(obj, val, descr, rewrite_args, r_descr, attr->s());
+        bool special_case_worked = dataDescriptorSetSpecialCases(obj, val, descr, rewrite_args, r_descr, attr);
         if (special_case_worked) {
             // We don't need to to the invalidation stuff in this case.
             return;
@@ -2044,14 +2182,15 @@ void setattrGeneric(Box* obj, BoxedString* attr, Box* val, SetattrRewriteArgs* r
             raiseAttributeError(obj, attr->s());
         }
 
-        obj->setattr(attr->s(), val, rewrite_args);
+        obj->setattr(attr, val, rewrite_args);
     }
 
     // TODO this should be in type_setattro
     if (isSubclass(obj->cls, type_cls)) {
         BoxedClass* self = static_cast<BoxedClass*>(obj);
 
-        if (attr->s() == "__base__" && self->getattr("__base__"))
+        static BoxedString* base_str = internStringImmortal("__base__");
+        if (attr->s() == "__base__" && self->getattr(base_str))
             raiseExcHelper(TypeError, "readonly attribute");
 
         bool touched_slot = update_slot(self, attr->s());
@@ -2099,6 +2238,7 @@ extern "C" void setattr(Box* obj, BoxedString* attr, Box* attr_val) {
     Box* setattr = NULL;
     RewriterVar* r_setattr;
     if (tp_setattro != PyObject_GenericSetAttr) {
+        static BoxedString* setattr_str = internStringImmortal("__setattr__");
         if (rewriter.get()) {
             GetattrRewriteArgs rewrite_args(rewriter.get(), rewriter->getArg(0)->getAttr(offsetof(Box, cls)),
                                             Location::any());
@@ -2119,7 +2259,7 @@ extern "C" void setattr(Box* obj, BoxedString* attr, Box* attr_val) {
 
     // We should probably add this as a GC root, but we can cheat a little bit since
     // we know it's not going to get deallocated:
-    static Box* object_setattr = object_cls->getattr("__setattr__");
+    static Box* object_setattr = object_cls->getattr(internStringImmortal("__setattr__"));
     assert(object_setattr);
 
     // I guess this check makes it ok for us to just rely on having guarded on the value of setattr without
@@ -2257,8 +2397,8 @@ extern "C" bool nonzero(Box* obj) {
     }
 
     // TODO: rewrite these.
-    static BoxedString* nonzero_str = static_cast<BoxedString*>(PyString_InternFromString("__nonzero__"));
-    static BoxedString* len_str = static_cast<BoxedString*>(PyString_InternFromString("__len__"));
+    static BoxedString* nonzero_str = internStringImmortal("__nonzero__");
+    static BoxedString* len_str = internStringImmortal("__len__");
     // go through descriptor logic
     Box* func = getclsattrInternal(obj, nonzero_str, NULL);
     if (!func)
@@ -2269,7 +2409,8 @@ extern "C" bool nonzero(Box* obj) {
                    || isSubclass(obj->cls, Exception) || obj->cls == file_cls || obj->cls == traceback_cls
                    || obj->cls == instancemethod_cls || obj->cls == module_cls || obj->cls == capifunc_cls
                    || obj->cls == builtin_function_or_method_cls || obj->cls == method_cls || obj->cls == frame_cls
-                   || obj->cls == capi_getset_cls || obj->cls == pyston_getset_cls || obj->cls == wrapperdescr_cls,
+                   || obj->cls == generator_cls || obj->cls == capi_getset_cls || obj->cls == pyston_getset_cls
+                   || obj->cls == wrapperdescr_cls,
                "%s.__nonzero__", getTypeName(obj)); // TODO
 
         // TODO should rewrite these?
@@ -2296,7 +2437,7 @@ extern "C" BoxedString* str(Box* obj) {
     static StatCounter slowpath_str("slowpath_str");
     slowpath_str.log();
 
-    static BoxedString* str_box = static_cast<BoxedString*>(PyString_InternFromString(str_str.c_str()));
+    static BoxedString* str_box = internStringImmortal(str_str.c_str());
     if (obj->cls != str_cls) {
         // TODO could do an IC optimization here (once we do rewrites here at all):
         // if __str__ is objectStr, just guard on that and call repr directly.
@@ -2328,7 +2469,7 @@ extern "C" BoxedString* repr(Box* obj) {
     static StatCounter slowpath_repr("slowpath_repr");
     slowpath_repr.log();
 
-    static BoxedString* repr_box = static_cast<BoxedString*>(PyString_InternFromString(repr_str.c_str()));
+    static BoxedString* repr_box = internStringImmortal(repr_str.c_str());
     obj = callattrInternal(obj, repr_box, CLASS_ONLY, NULL, ArgPassSpec(0), NULL, NULL, NULL, NULL, NULL);
 
     if (isSubclass(obj->cls, unicode_cls)) {
@@ -2410,7 +2551,7 @@ extern "C" BoxedInt* hash(Box* obj) {
 }
 
 extern "C" BoxedInt* lenInternal(Box* obj, LenRewriteArgs* rewrite_args) {
-    static BoxedString* len_str = static_cast<BoxedString*>(PyString_InternFromString("__len__"));
+    static BoxedString* len_str = internStringImmortal("__len__");
 
     // Corresponds to the first part of PyObject_Size:
     PySequenceMethods* m = obj->cls->tp_as_sequence;
@@ -3220,7 +3361,7 @@ void rearrangeArguments(ParamReceiveSpec paramspec, const ParamNames* param_name
     if (paramspec.takes_kwargs) {
         int kwargs_idx = paramspec.num_args + (paramspec.takes_varargs ? 1 : 0);
         if (rewrite_args) {
-            RewriterVar* r_kwargs = rewrite_args->rewriter->call(true, (void*)createDict);
+            RewriterVar* r_kwargs = rewrite_args->rewriter->loadConst(0);
 
             if (kwargs_idx == 0)
                 rewrite_args->arg1 = r_kwargs;
@@ -3267,7 +3408,10 @@ void rearrangeArguments(ParamReceiveSpec paramspec, const ParamNames* param_name
         Box* kwargs
             = getArg(argspec.num_args + argspec.num_keywords + (argspec.has_starargs ? 1 : 0), arg1, arg2, arg3, args);
 
-        if (!isSubclass(kwargs->cls, dict_cls)) {
+        if (!kwargs) {
+            // TODO could try to avoid creating this
+            kwargs = new BoxedDict();
+        } else if (!isSubclass(kwargs->cls, dict_cls)) {
             BoxedDict* d = new BoxedDict();
             dictMerge(d, kwargs);
             kwargs = d;
@@ -3591,17 +3735,17 @@ Box* runtimeCallInternal(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec ar
 
         Box* rtn;
 
+        static BoxedString* call_str = internStringImmortal("__call__");
+
         if (DEBUG >= 2) {
             assert((obj->cls->tp_call == NULL) == (typeLookup(obj->cls, call_str, NULL) == NULL));
         }
 
-        static BoxedString* call_box = static_cast<BoxedString*>(PyString_InternFromString(call_str.c_str()));
-
         if (rewrite_args) {
-            rtn = callattrInternal(obj, call_box, CLASS_ONLY, rewrite_args, argspec, arg1, arg2, arg3, args,
+            rtn = callattrInternal(obj, call_str, CLASS_ONLY, rewrite_args, argspec, arg1, arg2, arg3, args,
                                    keyword_names);
         } else {
-            rtn = callattrInternal(obj, call_box, CLASS_ONLY, NULL, argspec, arg1, arg2, arg3, args, keyword_names);
+            rtn = callattrInternal(obj, call_str, CLASS_ONLY, NULL, argspec, arg1, arg2, arg3, args, keyword_names);
         }
         if (!rtn)
             raiseExcHelper(TypeError, "'%s' object is not callable", getTypeName(obj));
@@ -3614,15 +3758,26 @@ Box* runtimeCallInternal(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec ar
             // already fit, either since the type inferencer could determine that,
             // or because they only need to fit into an UNKNOWN slot.
 
-            if (npassed_args >= 1)
-                rewrite_args->arg1->addAttrGuard(offsetof(Box, cls), (intptr_t)arg1->cls);
-            if (npassed_args >= 2)
-                rewrite_args->arg2->addAttrGuard(offsetof(Box, cls), (intptr_t)arg2->cls);
-            if (npassed_args >= 3)
-                rewrite_args->arg3->addAttrGuard(offsetof(Box, cls), (intptr_t)arg3->cls);
-            for (int i = 3; i < npassed_args; i++) {
-                RewriterVar* v = rewrite_args->args->getAttr((i - 3) * sizeof(Box*), Location::any());
-                v->addAttrGuard(offsetof(Box, cls), (intptr_t)args[i - 3]->cls);
+            int kwargs_index = -1;
+            if (argspec.has_kwargs)
+                kwargs_index = argspec.kwargsIndex();
+
+            for (int i = 0; i < npassed_args; i++) {
+                Box* v = getArg(i, arg1, arg2, arg3, args);
+
+                if (i == kwargs_index) {
+                    if (v == NULL) {
+                        // I don't think this case should ever get hit currently -- the only places
+                        // we offer rewriting are places that don't have the ability to pass a NULL
+                        // kwargs.
+                        getArg(i, rewrite_args)->addGuard(0);
+                    } else {
+                        getArg(i, rewrite_args)->addAttrGuard(offsetof(Box, cls), (intptr_t)v->cls);
+                    }
+                } else {
+                    assert(v);
+                    getArg(i, rewrite_args)->addAttrGuard(offsetof(Box, cls), (intptr_t)v->cls);
+                }
             }
             rewrite_args->args_guarded = true;
         }
@@ -3650,7 +3805,7 @@ Box* runtimeCallInternal(Box* obj, CallRewriteArgs* rewrite_args, ArgPassSpec ar
 
         RewriterVar* r_im_func;
         if (rewrite_args) {
-            r_im_func = rewrite_args->obj->getAttr(offsetof(BoxedInstanceMethod, obj), Location::any());
+            r_im_func = rewrite_args->obj->getAttr(offsetof(BoxedInstanceMethod, func), Location::any());
         }
 
         if (rewrite_args && !rewrite_args->func_guarded) {
@@ -4011,7 +4166,7 @@ Box* compareInternal(Box* lhs, Box* rhs, int op_type, CompareRewriteArgs* rewrit
     }
 
     if (op_type == AST_TYPE::In || op_type == AST_TYPE::NotIn) {
-        static BoxedString* contains_str = static_cast<BoxedString*>(PyString_InternFromString("__contains__"));
+        static BoxedString* contains_str = internStringImmortal("__contains__");
 
         // The checks for this branch are taken from CPython's PySequence_Contains
         if (PyType_HasFeature(rhs->cls, Py_TPFLAGS_HAVE_SEQUENCE_IN)) {
@@ -4054,7 +4209,7 @@ Box* compareInternal(Box* lhs, Box* rhs, int op_type, CompareRewriteArgs* rewrit
         }
 
         Box* contained;
-        RewriterVar* r_contained;
+        RewriterVar* r_contained = NULL;
         if (rewrite_args) {
             CallRewriteArgs crewrite_args(rewrite_args->rewriter, rewrite_args->rhs, rewrite_args->destination);
             crewrite_args.arg1 = rewrite_args->lhs;
@@ -4195,7 +4350,7 @@ Box* compareInternal(Box* lhs, Box* rhs, int op_type, CompareRewriteArgs* rewrit
     if (rrtn != NULL && rrtn != NotImplemented)
         return rrtn;
 
-    static BoxedString* cmp_str = static_cast<BoxedString*>(PyString_InternFromString("__cmp__"));
+    static BoxedString* cmp_str = internStringImmortal("__cmp__");
     lrtn = callattrInternal1(lhs, cmp_str, CLASS_ONLY, NULL, ArgPassSpec(1), rhs);
     if (lrtn && lrtn != NotImplemented) {
         return boxBool(convert3wayCompareResultToBool(lrtn, op_type));
@@ -4299,7 +4454,105 @@ extern "C" Box* unaryop(Box* operand, int op_type) {
     return rtn;
 }
 
-extern "C" Box* getitem(Box* value, Box* slice) {
+Box* callItemAttr(Box* target, BoxedString* item_str, Box* item, Box* value, CallRewriteArgs* rewrite_args) {
+    if (value) {
+        return callattrInternal2(target, item_str, CLASS_ONLY, rewrite_args, ArgPassSpec(2), item, value);
+    } else {
+        return callattrInternal1(target, item_str, CLASS_ONLY, rewrite_args, ArgPassSpec(1), item);
+    }
+}
+
+// This function decides whether to call the slice operator (e.g. __getslice__)
+// or the item operator (__getitem__).
+Box* callItemOrSliceAttr(Box* target, BoxedString* item_str, BoxedString* slice_str, Box* slice, Box* value,
+                         CallRewriteArgs* rewrite_args) {
+
+    // This function contains a lot of logic for deciding between whether to call
+    // the slice operator or the item operator, so we can match CPython's behavior
+    // on custom classes that define those operators. However, for builtin types,
+    // we know we can call either and the behavior will be the same. Adding all those
+    // guards are unnecessary and bad for performance.
+    //
+    // Also, for special slicing logic (e.g. open slice ranges [:]), the builtin types
+    // have C-implemented functions that already handle all the edge cases, so we don't
+    // need to have a slowpath for them here.
+    if (target->cls == list_cls || target->cls == str_cls || target->cls == unicode_cls) {
+        if (rewrite_args) {
+            rewrite_args->obj->addAttrGuard(offsetof(Box, cls), (uint64_t)target->cls);
+        }
+        return callItemAttr(target, item_str, slice, value, rewrite_args);
+    }
+
+    // Guard on the type of the object (need to have the slice operator attribute to call it).
+    Box* slice_attr = NULL;
+    if (rewrite_args) {
+        RewriterVar* target_cls = rewrite_args->obj->getAttr(offsetof(Box, cls));
+        GetattrRewriteArgs grewrite_args(rewrite_args->rewriter, target_cls, Location::any());
+        slice_attr = typeLookup(target->cls, slice_str, &grewrite_args);
+        if (!grewrite_args.out_success) {
+            rewrite_args = NULL;
+        }
+    } else {
+        slice_attr = typeLookup(target->cls, slice_str, NULL);
+    }
+
+    if (!slice_attr) {
+        return callItemAttr(target, item_str, slice, value, rewrite_args);
+    }
+
+    // Need a slice object to use the slice operators.
+    if (rewrite_args) {
+        rewrite_args->arg1->addAttrGuard(offsetof(Box, cls), (uint64_t)slice->cls);
+    }
+    if (slice->cls != slice_cls) {
+        return callItemAttr(target, item_str, slice, value, rewrite_args);
+    }
+
+    BoxedSlice* bslice = (BoxedSlice*)slice;
+
+    // If we use slice notation with a step parameter (e.g. o[1:10:2]), the slice operator
+    // functions don't support that, so fallback to the item operator functions.
+    if (bslice->step->cls != none_cls) {
+        if (rewrite_args) {
+            rewrite_args->arg1->getAttr(offsetof(BoxedSlice, step))
+                ->addAttrGuard(offsetof(Box, cls), (uint64_t)none_cls, /*negate=*/true);
+        }
+
+        return callItemAttr(target, item_str, slice, value, rewrite_args);
+    } else {
+        rewrite_args = NULL;
+        REWRITE_ABORTED("");
+
+        // If the slice cannot be used as integer slices, also fall back to the get operator.
+        // We could optimize further here by having a version of isSliceIndex that
+        // creates guards, but it would only affect some rare edge cases.
+        if (!isSliceIndex(bslice->start) || !isSliceIndex(bslice->stop)) {
+            return callItemAttr(target, item_str, slice, value, rewrite_args);
+        }
+
+        // If we don't specify the start/stop (e.g. o[:]), the slice operator functions
+        // CPython seems to use 0 and sys.maxint as the default values.
+        int64_t start = 0, stop = PyInt_GetMax();
+        sliceIndex(bslice->start, &start);
+        sliceIndex(bslice->stop, &stop);
+
+        adjustNegativeIndicesOnObject(target, &start, &stop);
+
+        Box* boxedStart = boxInt(start);
+        Box* boxedStop = boxInt(stop);
+
+        if (value) {
+            return callattrInternal3(target, slice_str, CLASS_ONLY, rewrite_args, ArgPassSpec(3), boxedStart, boxedStop,
+                                     value);
+        } else {
+            return callattrInternal2(target, slice_str, CLASS_ONLY, rewrite_args, ArgPassSpec(2), boxedStart,
+                                     boxedStop);
+        }
+    }
+}
+
+// target[slice]
+extern "C" Box* getitem(Box* target, Box* slice) {
     STAT_TIMER(t0, "us_timer_slowpath_getitem", 10);
 
     // This possibly could just be represented as a single callattr; the only tricky part
@@ -4320,7 +4573,7 @@ extern "C" Box* getitem(Box* value, Box* slice) {
     // For now, just use the first clause: call mp_subscript if it exists.
     // And only if we think it's better than calling __getitem__, which should
     // exist if mp_subscript exists.
-    PyMappingMethods* m = value->cls->tp_as_mapping;
+    PyMappingMethods* m = target->cls->tp_as_mapping;
     if (m && m->mp_subscript && m->mp_subscript != slot_mp_subscript) {
         if (rewriter.get()) {
             RewriterVar* r_obj = rewriter->getArg(0);
@@ -4339,38 +4592,41 @@ extern "C" Box* getitem(Box* value, Box* slice) {
             rewriter->call(true, (void*)checkAndThrowCAPIException);
             rewriter->commitReturning(r_rtn);
         }
-        Box* r = m->mp_subscript(value, slice);
+        Box* r = m->mp_subscript(target, slice);
         if (!r)
             throwCAPIException();
         return r;
     }
 
-    static BoxedString* getitem_str = static_cast<BoxedString*>(PyString_InternFromString("__getitem__"));
+    static BoxedString* getitem_str = internStringImmortal("__getitem__");
+    static BoxedString* getslice_str = internStringImmortal("__getslice__");
+
     Box* rtn;
     if (rewriter.get()) {
         CallRewriteArgs rewrite_args(rewriter.get(), rewriter->getArg(0), rewriter->getReturnDestination());
         rewrite_args.arg1 = rewriter->getArg(1);
 
-        rtn = callattrInternal1(value, getitem_str, CLASS_ONLY, &rewrite_args, ArgPassSpec(1), slice);
+        rtn = callItemOrSliceAttr(target, getitem_str, getslice_str, slice, NULL, &rewrite_args);
 
         if (!rewrite_args.out_success) {
             rewriter.reset(NULL);
-        } else if (rtn)
+        } else if (rtn) {
             rewriter->commitReturning(rewrite_args.out_rtn);
+        }
     } else {
-        rtn = callattrInternal1(value, getitem_str, CLASS_ONLY, NULL, ArgPassSpec(1), slice);
+        rtn = callItemOrSliceAttr(target, getitem_str, getslice_str, slice, NULL, NULL);
     }
 
     if (rtn == NULL) {
         // different versions of python give different error messages for this:
         if (PYTHON_VERSION_MAJOR == 2 && PYTHON_VERSION_MINOR < 7) {
-            raiseExcHelper(TypeError, "'%s' object is unsubscriptable", getTypeName(value)); // tested on 2.6.6
+            raiseExcHelper(TypeError, "'%s' object is unsubscriptable", getTypeName(target)); // tested on 2.6.6
         } else if (PYTHON_VERSION_MAJOR == 2 && PYTHON_VERSION_MINOR == 7 && PYTHON_VERSION_MICRO < 3) {
-            raiseExcHelper(TypeError, "'%s' object is not subscriptable", getTypeName(value)); // tested on 2.7.1
+            raiseExcHelper(TypeError, "'%s' object is not subscriptable", getTypeName(target)); // tested on 2.7.1
         } else {
             // Changed to this in 2.7.3:
             raiseExcHelper(TypeError, "'%s' object has no attribute '__getitem__'",
-                           getTypeName(value)); // tested on 2.7.3
+                           getTypeName(target)); // tested on 2.7.3
         }
     }
 
@@ -4387,7 +4643,8 @@ extern "C" void setitem(Box* target, Box* slice, Box* value) {
     std::unique_ptr<Rewriter> rewriter(
         Rewriter::createRewriter(__builtin_extract_return_addr(__builtin_return_address(0)), 3, "setitem"));
 
-    static BoxedString* setitem_str = static_cast<BoxedString*>(PyString_InternFromString("__setitem__"));
+    static BoxedString* setitem_str = internStringImmortal("__setitem__");
+    static BoxedString* setslice_str = internStringImmortal("__setslice__");
 
     Box* rtn;
     if (rewriter.get()) {
@@ -4395,25 +4652,24 @@ extern "C" void setitem(Box* target, Box* slice, Box* value) {
         rewrite_args.arg1 = rewriter->getArg(1);
         rewrite_args.arg2 = rewriter->getArg(2);
 
-        rtn = callattrInternal2(target, setitem_str, CLASS_ONLY, &rewrite_args, ArgPassSpec(2), slice, value);
+        rtn = callItemOrSliceAttr(target, setitem_str, setslice_str, slice, value, &rewrite_args);
 
         if (!rewrite_args.out_success) {
             rewriter.reset(NULL);
         }
     } else {
-        rtn = callattrInternal2(target, setitem_str, CLASS_ONLY, NULL, ArgPassSpec(2), slice, value);
+        rtn = callItemOrSliceAttr(target, setitem_str, setslice_str, slice, value, NULL);
     }
 
     if (rtn == NULL) {
         raiseExcHelper(TypeError, "'%s' object does not support item assignment", getTypeName(target));
     }
 
-    if (rewriter.get()) {
+    if (rewriter.get())
         rewriter->commit();
-    }
 }
 
-// del target[start:end:step]
+// del target[slice]
 extern "C" void delitem(Box* target, Box* slice) {
     STAT_TIMER(t0, "us_timer_slowpath_delitem", 10);
 
@@ -4423,33 +4679,33 @@ extern "C" void delitem(Box* target, Box* slice) {
     std::unique_ptr<Rewriter> rewriter(
         Rewriter::createRewriter(__builtin_extract_return_addr(__builtin_return_address(0)), 2, "delitem"));
 
-    static BoxedString* delitem_str = static_cast<BoxedString*>(PyString_InternFromString("__delitem__"));
+    static BoxedString* delitem_str = internStringImmortal("__delitem__");
+    static BoxedString* delslice_str = internStringImmortal("__delslice__");
 
     Box* rtn;
     if (rewriter.get()) {
         CallRewriteArgs rewrite_args(rewriter.get(), rewriter->getArg(0), rewriter->getReturnDestination());
         rewrite_args.arg1 = rewriter->getArg(1);
 
-        rtn = callattrInternal1(target, delitem_str, CLASS_ONLY, &rewrite_args, ArgPassSpec(1), slice);
+        rtn = callItemOrSliceAttr(target, delitem_str, delslice_str, slice, NULL, &rewrite_args);
 
         if (!rewrite_args.out_success) {
             rewriter.reset(NULL);
         }
-
     } else {
-        rtn = callattrInternal1(target, delitem_str, CLASS_ONLY, NULL, ArgPassSpec(1), slice);
+        rtn = callItemOrSliceAttr(target, delitem_str, delslice_str, slice, NULL, NULL);
     }
 
     if (rtn == NULL) {
         raiseExcHelper(TypeError, "'%s' object does not support item deletion", getTypeName(target));
     }
 
-    if (rewriter.get()) {
+    if (rewriter.get())
         rewriter->commit();
-    }
 }
 
-void Box::delattr(llvm::StringRef attr, DelattrRewriteArgs* rewrite_args) {
+void Box::delattr(BoxedString* attr, DelattrRewriteArgs* rewrite_args) {
+    assert(attr->interned_state != SSTATE_NOT_INTERNED);
     if (cls->instancesHaveHCAttrs()) {
         // as soon as the hcls changes, the guard on hidden class won't pass.
         HCAttrs* attrs = getHCAttrsPtr();
@@ -4461,8 +4717,8 @@ void Box::delattr(llvm::StringRef attr, DelattrRewriteArgs* rewrite_args) {
             rewrite_args = NULL;
             Box* d = attrs->attr_list->attrs[0];
             assert(d);
-            assert(attr.data()[attr.size()] == '\0');
-            PyDict_DelItemString(d, attr.data());
+            assert(attr->data()[attr->size()] == '\0');
+            PyDict_DelItem(d, attr);
             checkAndThrowCAPIException();
             return;
         }
@@ -4501,8 +4757,9 @@ void Box::delattr(llvm::StringRef attr, DelattrRewriteArgs* rewrite_args) {
 
 extern "C" void delattrGeneric(Box* obj, BoxedString* attr, DelattrRewriteArgs* rewrite_args) {
     // first check whether the deleting attribute is a descriptor
-    Box* clsAttr = typeLookup(obj->cls, attr->s(), NULL);
+    Box* clsAttr = typeLookup(obj->cls, attr, NULL);
     if (clsAttr != NULL) {
+        static BoxedString* delete_str = internStringImmortal("__delete__");
         Box* delAttr = typeLookup(static_cast<BoxedClass*>(clsAttr->cls), delete_str, NULL);
 
         if (delAttr != NULL) {
@@ -4512,9 +4769,9 @@ extern "C" void delattrGeneric(Box* obj, BoxedString* attr, DelattrRewriteArgs* 
     }
 
     // check if the attribute is in the instance's __dict__
-    Box* attrVal = obj->getattr(attr->s(), NULL);
+    Box* attrVal = obj->getattr(attr, NULL);
     if (attrVal != NULL) {
-        obj->delattr(attr->s(), NULL);
+        obj->delattr(attr, NULL);
     } else {
         // the exception cpthon throws is different when the class contains the attribute
         if (clsAttr != NULL) {
@@ -4530,7 +4787,8 @@ extern "C" void delattrGeneric(Box* obj, BoxedString* attr, DelattrRewriteArgs* 
     if (isSubclass(obj->cls, type_cls)) {
         BoxedClass* self = static_cast<BoxedClass*>(obj);
 
-        if (attr->s() == "__base__" && self->getattr("__base__"))
+        static BoxedString* base_str = internStringImmortal("__base__");
+        if (attr->s() == "__base__" && self->getattr(base_str))
             raiseExcHelper(TypeError, "readonly attribute");
 
         assert(attr->data()[attr->size()] == '\0');
@@ -4546,6 +4804,7 @@ extern "C" void delattrGeneric(Box* obj, BoxedString* attr, DelattrRewriteArgs* 
 }
 
 extern "C" void delattrInternal(Box* obj, BoxedString* attr, DelattrRewriteArgs* rewrite_args) {
+    static BoxedString* delattr_str = internStringImmortal("__delattr__");
     Box* delAttr = typeLookup(obj->cls, delattr_str, NULL);
     if (delAttr != NULL) {
         Box* rtn = runtimeCallInternal(delAttr, NULL, ArgPassSpec(2), obj, attr, NULL, NULL, NULL);
@@ -4582,6 +4841,8 @@ extern "C" Box* createBoxedIterWrapperIfNeeded(Box* o) {
 
     std::unique_ptr<Rewriter> rewriter(Rewriter::createRewriter(
         __builtin_extract_return_addr(__builtin_return_address(0)), 1, "createBoxedIterWrapperIfNeeded"));
+
+    static BoxedString* hasnext_str = internStringImmortal("__hasnext__");
 
     if (rewriter.get()) {
         RewriterVar* r_o = rewriter->getArg(0);
@@ -4622,6 +4883,7 @@ extern "C" Box* getPystonIter(Box* o) {
 }
 
 extern "C" Box* getiterHelper(Box* o) {
+    static BoxedString* getitem_str = internStringImmortal("__getitem__");
     if (typeLookup(o->cls, getitem_str, NULL))
         return new BoxedSeqIter(o, 0);
     raiseExcHelper(TypeError, "'%s' object is not iterable", getTypeName(o));
@@ -4629,7 +4891,7 @@ extern "C" Box* getiterHelper(Box* o) {
 
 Box* getiter(Box* o) {
     // TODO add rewriting to this?  probably want to try to avoid this path though
-    static BoxedString* iter_str = static_cast<BoxedString*>(PyString_InternFromString("__iter__"));
+    static BoxedString* iter_str = internStringImmortal("__iter__");
     Box* r = callattrInternal0(o, iter_str, LookupScope::CLASS_ONLY, NULL, ArgPassSpec(0));
     if (r)
         return r;
@@ -4718,7 +4980,7 @@ Box* typeNew(Box* _cls, Box* arg1, Box* arg2, Box** _args) {
                                   "of the metaclasses of all its bases");
     }
 
-    static BoxedString* new_box = static_cast<BoxedString*>(PyString_InternFromString(new_str.c_str()));
+    static BoxedString* new_box = internStringImmortal(new_str.c_str());
     if (winner != metatype) {
         if (getattr(winner, new_box) != getattr(type_cls, new_box)) {
             CallattrFlags callattr_flags
@@ -4736,7 +4998,8 @@ Box* typeNew(Box* _cls, Box* arg1, Box* arg2, Box** _args) {
     assert(isSubclass(base->cls, type_cls));
 
     // Handle slots
-    Box* boxedSlots = PyDict_GetItemString(attr_dict, "__slots__");
+    static BoxedString* slots_str = internStringImmortal("__slots__");
+    Box* boxedSlots = PyDict_GetItem(attr_dict, slots_str);
     int add_dict = 0;
     int add_weak = 0;
     bool may_add_dict = base->tp_dictoffset == 0 && base->attrs_offset == 0;
@@ -4896,24 +5159,32 @@ Box* typeNew(Box* _cls, Box* arg1, Box* arg2, Box** _args) {
                base_heap_cls->nslots() * sizeof(BoxedHeapClass::SlotOffset));
     }
 
-    if (made->instancesHaveHCAttrs() || made->instancesHaveDictAttrs())
-        made->setattr("__dict__", dict_descr, NULL);
+    if (made->instancesHaveHCAttrs() || made->instancesHaveDictAttrs()) {
+        static BoxedString* dict_str = internStringImmortal("__dict__");
+        made->setattr(dict_str, dict_descr, NULL);
+    }
 
     for (const auto& p : attr_dict->d) {
         auto k = coerceUnicodeToStr(p.first);
 
         RELEASE_ASSERT(k->cls == str_cls, "");
-        made->setattr(static_cast<BoxedString*>(k)->s(), p.second, NULL);
+        BoxedString* s = static_cast<BoxedString*>(k);
+        internStringMortalInplace(s);
+        made->setattr(s, p.second, NULL);
     }
 
-    if (!made->hasattr("__module__")) {
+    static BoxedString* module_str = internStringImmortal("__module__");
+    if (!made->hasattr(module_str)) {
         Box* gl = getGlobalsDict();
-        Box* attr = PyDict_GetItemString(gl, "__name__");
+        static BoxedString* name_str = internStringImmortal("__name__");
+        Box* attr = PyDict_GetItem(gl, name_str);
         if (attr)
-            made->giveAttr("__module__", attr);
+            made->giveAttr(module_str, attr);
     }
-    if (!made->hasattr("__doc__"))
-        made->giveAttr("__doc__", None);
+
+    static BoxedString* doc_str = internStringImmortal("__doc__");
+    if (!made->hasattr(doc_str))
+        made->giveAttr(doc_str, None);
 
     made->tp_new = base->tp_new;
 
@@ -4924,15 +5195,25 @@ Box* typeNew(Box* _cls, Box* arg1, Box* arg2, Box** _args) {
     else
         made->tp_alloc = PyType_GenericAlloc;
 
-    assert(!made->simple_destructor);
-    for (auto b : *bases) {
-        if (!isSubclass(b->cls, type_cls))
-            continue;
-        BoxedClass* b_cls = static_cast<BoxedClass*>(b);
-        RELEASE_ASSERT(made->simple_destructor == base->simple_destructor || made->simple_destructor == NULL
-                           || base->simple_destructor == NULL,
-                       "Conflicting simple destructors!");
-        made->simple_destructor = base->simple_destructor;
+    // On some occasions, Python-implemented classes inherit from C-implement classes. For
+    // example, KeyedRef inherits from weakref, and needs to have it's finalizer called
+    // whenever weakref would. So we inherit the property that a class has a safe tp_dealloc
+    // too. However, we must be careful to do that only when nothing else invalidates that
+    // property, such as the presence of a __del__ (tp_del) method.
+    assert(!made->has_safe_tp_dealloc);
+    if (!made->tp_del) {
+        for (auto b : *bases) {
+            BoxedClass* base = static_cast<BoxedClass*>(b);
+            if (!isSubclass(base->cls, type_cls))
+                continue;
+            if (base->tp_del) {
+                break;
+            }
+            if (base->has_safe_tp_dealloc) {
+                made->has_safe_tp_dealloc = true;
+                break;
+            }
+        }
     }
 
     return made;
@@ -4941,11 +5222,11 @@ Box* typeNew(Box* _cls, Box* arg1, Box* arg2, Box** _args) {
 extern "C" void delGlobal(Box* globals, BoxedString* name) {
     if (globals->cls == module_cls) {
         BoxedModule* m = static_cast<BoxedModule*>(globals);
-        if (!m->getattr(name->s())) {
+        if (!m->getattr(name)) {
             assert(name->data()[name->size()] == '\0');
             raiseExcHelper(NameError, "name '%s' is not defined", name->data());
         }
-        m->delattr(name->s(), NULL);
+        m->delattr(name, NULL);
     } else {
         assert(globals->cls == dict_cls);
         BoxedDict* d = static_cast<BoxedDict*>(globals);
@@ -4990,7 +5271,7 @@ extern "C" Box* getGlobal(Box* globals, BoxedString* name) {
                 r_mod->addAttrGuard(offsetof(Box, cls), (intptr_t)module_cls);
 
                 GetattrRewriteArgs rewrite_args(rewriter.get(), r_mod, rewriter->getReturnDestination());
-                r = m->getattr(name->s(), &rewrite_args);
+                r = m->getattr(name, &rewrite_args);
                 if (!rewrite_args.out_success) {
                     rewriter.reset(NULL);
                 }
@@ -5001,7 +5282,7 @@ extern "C" Box* getGlobal(Box* globals, BoxedString* name) {
                     return r;
                 }
             } else {
-                r = m->getattr(name->s(), NULL);
+                r = m->getattr(name, NULL);
                 nopatch_getglobal.log();
                 if (r) {
                     return r;
@@ -5027,7 +5308,8 @@ extern "C" Box* getGlobal(Box* globals, BoxedString* name) {
         if (rewriter.get()) {
             RewriterVar* builtins = rewriter->loadConst((intptr_t)builtins_module, Location::any());
             GetattrRewriteArgs rewrite_args(rewriter.get(), builtins, rewriter->getReturnDestination());
-            rtn = builtins_module->getattr(name->s(), &rewrite_args);
+            rewrite_args.obj_shape_guarded = true; // always builtin module
+            rtn = builtins_module->getattr(name, &rewrite_args);
 
             if (!rtn || !rewrite_args.out_success) {
                 rewriter.reset(NULL);
@@ -5037,7 +5319,7 @@ extern "C" Box* getGlobal(Box* globals, BoxedString* name) {
                 rewriter->commitReturning(rewrite_args.out_rtn);
             }
         } else {
-            rtn = builtins_module->getattr(name->s(), NULL);
+            rtn = builtins_module->getattr(name, NULL);
         }
 
         if (rtn)
@@ -5055,7 +5337,7 @@ Box* getFromGlobals(Box* globals, BoxedString* name) {
     }
 
     if (globals->cls == module_cls) {
-        return globals->getattr(name->s());
+        return globals->getattr(name);
     } else if (globals->cls == dict_cls) {
         auto d = static_cast<BoxedDict*>(globals)->d;
         auto it = d.find(name);
@@ -5097,9 +5379,11 @@ extern "C" Box* importStar(Box* _from_module, Box* to_globals) {
     RELEASE_ASSERT(isSubclass(_from_module->cls, module_cls), "%s", _from_module->cls->tp_name);
     BoxedModule* from_module = static_cast<BoxedModule*>(_from_module);
 
+    static BoxedString* all_str = internStringImmortal("__all__");
     Box* all = from_module->getattr(all_str);
 
     if (all) {
+        static BoxedString* getitem_str = internStringImmortal("__getitem__");
         Box* all_getitem = typeLookup(all->cls, getitem_str, NULL);
         if (!all_getitem)
             raiseExcHelper(TypeError, "'%s' object does not support indexing", getTypeName(all));
@@ -5122,7 +5406,8 @@ extern "C" Box* importStar(Box* _from_module, Box* to_globals) {
                 raiseExcHelper(TypeError, "attribute name must be string, not '%s'", getTypeName(attr_name));
 
             BoxedString* casted_attr_name = static_cast<BoxedString*>(attr_name);
-            Box* attr_value = from_module->getattr(casted_attr_name->s());
+            internStringMortalInplace(casted_attr_name);
+            Box* attr_value = from_module->getattr(casted_attr_name);
 
             if (!attr_value)
                 raiseExcHelper(AttributeError, "'module' object has no attribute '%s'", casted_attr_name->data());
@@ -5133,10 +5418,10 @@ extern "C" Box* importStar(Box* _from_module, Box* to_globals) {
 
     HCAttrs* module_attrs = from_module->getHCAttrsPtr();
     for (auto& p : module_attrs->hcls->getStrAttrOffsets()) {
-        if (p.first()[0] == '_')
+        if (p.first->data()[0] == '_')
             continue;
 
-        setGlobal(to_globals, boxString(p.first()), module_attrs->attr_list->attrs[p.second]);
+        setGlobal(to_globals, p.first, module_attrs->attr_list->attrs[p.second]);
     }
 
     return None;

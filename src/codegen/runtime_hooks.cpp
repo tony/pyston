@@ -40,6 +40,7 @@
 #include "runtime/generator.h"
 #include "runtime/import.h"
 #include "runtime/inline/boxing.h"
+#include "runtime/inline/list.h"
 #include "runtime/int.h"
 #include "runtime/long.h"
 #include "runtime/objmodel.h"
@@ -170,7 +171,7 @@ void initGlobalFuncs(GlobalState& g) {
     g.funcs.malloc = addFunc((void*)malloc, g.i8_ptr, g.i64);
     g.funcs.free = addFunc((void*)free, g.void_, g.i8_ptr);
 
-    g.funcs.allowGLReadPreemption = addFunc((void*)threading::allowGLReadPreemption, g.void_);
+    g.funcs.allowGLReadPreemption = getFunc((void*)threading::allowGLReadPreemption, "allowGLReadPreemption");
 
     GET(softspace);
 
