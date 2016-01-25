@@ -170,7 +170,6 @@ extern "C" Box* createDict();
 extern "C" Box* createList();
 extern "C" Box* createSlice(Box* start, Box* stop, Box* step);
 extern "C" Box* createTuple(int64_t nelts, Box** elts);
-extern "C" void printFloat(double d);
 
 Box* objectStr(Box*);
 Box* objectRepr(Box*);
@@ -390,6 +389,10 @@ public:
     DEFAULT_CLASS_SIMPLE(complex_cls);
 };
 
+static_assert(sizeof(BoxedComplex) == sizeof(PyComplexObject), "");
+static_assert(offsetof(BoxedComplex, real) == offsetof(PyComplexObject, cval.real), "");
+static_assert(offsetof(BoxedComplex, imag) == offsetof(PyComplexObject, cval.imag), "");
+
 class BoxedBool : public BoxedInt {
 public:
     BoxedBool(bool b) __attribute__((visibility("default"))) : BoxedInt(b ? 1 : 0) {}
@@ -404,7 +407,8 @@ public:
     llvm::StringRef s() const { return llvm::StringRef(s_data, ob_size); };
 
     long hash; // -1 means not yet computed
-    char interned_state;
+    int interned_state;
+    char s_data[0];
 
     char* data() { return s_data; }
     const char* c_str() {
@@ -459,10 +463,13 @@ private:
 
     BoxedString(size_t n); // non-initializing constructor
 
-    char s_data[0];
-
     friend void setupRuntime();
 };
+static_assert(sizeof(BoxedString) == sizeof(PyStringObject), "");
+static_assert(offsetof(BoxedString, ob_size) == offsetof(PyStringObject, ob_size), "");
+static_assert(offsetof(BoxedString, hash) == offsetof(PyStringObject, ob_shash), "");
+static_assert(offsetof(BoxedString, interned_state) == offsetof(PyStringObject, ob_sstate), "");
+static_assert(offsetof(BoxedString, s_data) == offsetof(PyStringObject, ob_sval), "");
 
 extern "C" size_t strHashUnboxed(BoxedString* self);
 extern "C" int64_t hashUnboxed(Box* obj);
@@ -944,9 +951,12 @@ public:
     Box* (*get)(Box*, void*);
     void (*set)(Box*, Box*, void*);
     void* closure;
+    BoxedString* name;
 
-    BoxedGetsetDescriptor(Box* (*get)(Box*, void*), void (*set)(Box*, Box*, void*), void* closure)
-        : get(get), set(set), closure(closure) {}
+    BoxedGetsetDescriptor(BoxedString* name, Box* (*get)(Box*, void*), void (*set)(Box*, Box*, void*), void* closure)
+        : get(get), set(set), closure(closure), name(name) {}
+
+    static void gcHandler(GCVisitor* v, Box* b);
 
     // No DEFAULT_CLASS annotation here -- force callers to explicitly specifiy pyston_getset_cls or capi_getset_cls
 };

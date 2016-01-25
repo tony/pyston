@@ -186,7 +186,7 @@ static Box* propertyDeleter(Box* self, Box* obj) {
 }
 
 static Box* staticmethodInit(Box* _self, Box* f) {
-    RELEASE_ASSERT(_self->cls == staticmethod_cls, "");
+    RELEASE_ASSERT(isSubclass(_self->cls, staticmethod_cls), "");
     BoxedStaticmethod* self = static_cast<BoxedStaticmethod*>(_self);
     self->sm_callable = f;
 
@@ -194,7 +194,7 @@ static Box* staticmethodInit(Box* _self, Box* f) {
 }
 
 static Box* staticmethodGet(Box* self, Box* obj, Box* type) {
-    RELEASE_ASSERT(self->cls == staticmethod_cls, "");
+    RELEASE_ASSERT(isSubclass(self->cls, staticmethod_cls), "");
 
     BoxedStaticmethod* sm = static_cast<BoxedStaticmethod*>(self);
 
@@ -210,7 +210,7 @@ extern "C" PyObject* PyClassMethod_New(PyObject* callable) noexcept {
 }
 
 static Box* classmethodInit(Box* _self, Box* f) {
-    RELEASE_ASSERT(_self->cls == classmethod_cls, "");
+    RELEASE_ASSERT(isSubclass(_self->cls, classmethod_cls), "");
     BoxedClassmethod* self = static_cast<BoxedClassmethod*>(_self);
     self->cm_callable = f;
 
@@ -218,7 +218,7 @@ static Box* classmethodInit(Box* _self, Box* f) {
 }
 
 static Box* classmethodGet(Box* self, Box* obj, Box* type) {
-    RELEASE_ASSERT(self->cls == classmethod_cls, "");
+    RELEASE_ASSERT(isSubclass(self->cls, classmethod_cls), "");
 
     BoxedClassmethod* cm = static_cast<BoxedClassmethod*>(self);
 
@@ -688,7 +688,8 @@ extern "C" PyObject* PyDescr_NewMember(PyTypeObject* x, struct PyMemberDef* y) n
 
 extern "C" PyObject* PyDescr_NewGetSet(PyTypeObject* x, struct PyGetSetDef* y) noexcept {
     // TODO do something with __doc__
-    return new (capi_getset_cls) BoxedGetsetDescriptor(y->get, (void (*)(Box*, Box*, void*))y->set, y->closure);
+    return new (capi_getset_cls)
+        BoxedGetsetDescriptor(internStringMortal(y->name), y->get, (void (*)(Box*, Box*, void*))y->set, y->closure);
 }
 
 extern "C" PyObject* PyDescr_NewClassMethod(PyTypeObject* type, PyMethodDef* method) noexcept {
@@ -756,14 +757,13 @@ void setupDescr() {
     method_cls->giveAttr("__call__", new BoxedFunction(method_call_cl));
     method_cls->tpp_call.capi_val = BoxedMethodDescriptor::tppCall<CAPI>;
     method_cls->tpp_call.cxx_val = BoxedMethodDescriptor::tppCall<CXX>;
-    method_cls->giveAttr("__doc__", new (pyston_getset_cls) BoxedGetsetDescriptor(methodGetDoc, NULL, NULL));
+    method_cls->giveAttrDescriptor("__doc__", methodGetDoc, NULL);
     method_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)methodRepr, UNKNOWN, 1)));
     method_cls->freeze();
 
     wrapperdescr_cls->giveAttr("__call__", new BoxedFunction(FunctionMetadata::create(
                                                (void*)BoxedWrapperDescriptor::__call__, UNKNOWN, 2, true, true)));
-    wrapperdescr_cls->giveAttr("__doc__",
-                               new (pyston_getset_cls) BoxedGetsetDescriptor(wrapperdescrGetDoc, NULL, NULL));
+    wrapperdescr_cls->giveAttrDescriptor("__doc__", wrapperdescrGetDoc, NULL);
     wrapperdescr_cls->tp_descr_get = BoxedWrapperDescriptor::descr_get;
     wrapperdescr_cls->tpp_call.capi_val = BoxedWrapperDescriptor::tppCall<CAPI>;
     wrapperdescr_cls->tpp_call.cxx_val = BoxedWrapperDescriptor::tppCall<CXX>;
@@ -777,8 +777,7 @@ void setupDescr() {
                                                 (void*)BoxedWrapperObject::__call__, UNKNOWN, 1, true, true)));
     wrapperobject_cls->tpp_call.capi_val = BoxedWrapperObject::tppCall<CAPI>;
     wrapperobject_cls->tpp_call.cxx_val = BoxedWrapperObject::tppCall<CXX>;
-    wrapperobject_cls->giveAttr("__doc__",
-                                new (pyston_getset_cls) BoxedGetsetDescriptor(wrapperobjectGetDoc, NULL, NULL));
+    wrapperobject_cls->giveAttrDescriptor("__doc__", wrapperobjectGetDoc, NULL);
     wrapperobject_cls->giveAttr("__repr__",
                                 new BoxedFunction(FunctionMetadata::create((void*)wrapperObjectRepr, UNKNOWN, 1)));
     wrapperobject_cls->freeze();

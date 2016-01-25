@@ -77,6 +77,7 @@ extern "C" void initzlib();
 extern "C" void init_codecs();
 extern "C" void init_socket();
 extern "C" void _PyUnicode_Init();
+extern "C" void _PyWarnings_Init() noexcept;
 extern "C" void _string_init();
 extern "C" void initunicodedata();
 extern "C" void init_weakref();
@@ -88,6 +89,7 @@ extern "C" void init_ssl();
 extern "C" void init_sqlite3();
 extern "C" void PyMarshal_Init();
 extern "C" void initstrop();
+extern "C" void init_ast();
 
 namespace pyston {
 
@@ -547,7 +549,7 @@ Box* BoxedModule::getUnicodeConstant(llvm::StringRef ast_str) {
 BoxedInt* BoxedModule::getIntConstant(int64_t n) {
     BoxedInt*& r = int_constants[n];
     if (!r)
-        r = new BoxedInt(n);
+        r = (BoxedInt*)boxInt(n);
     return r;
 }
 
@@ -1477,6 +1479,12 @@ void BoxedInstanceMethod::gcHandler(GCVisitor* v, Box* b) {
     v->visit(&im->obj);
     v->visit(&im->func);
     v->visit(&im->im_class);
+}
+
+void BoxedGetsetDescriptor::gcHandler(GCVisitor* v, Box* b) {
+    assert(isSubclass(b->cls, pyston_getset_cls) || isSubclass(b->cls, capi_getset_cls));
+    BoxedGetsetDescriptor* descr = static_cast<BoxedGetsetDescriptor*>(b);
+    v->visit(&descr->name);
 }
 
 void BoxedProperty::gcHandler(GCVisitor* v, Box* b) {
@@ -2510,6 +2518,12 @@ public:
         return r ? True : False;
     }
 
+    static Box* hasKey(Box* _self, Box* _key) {
+        if (PyErr_WarnPy3k("dict.has_key() not supported in 3.x; use the in operator", 1) < 0)
+            throwCAPIException();
+        return contains<CXX>(_self, _key);
+    }
+
     static int sq_contains(Box* _self, Box* _key) noexcept {
         Box* rtn = contains<CAPI>(_self, _key);
         if (!rtn)
@@ -2726,6 +2740,11 @@ Box* AttrWrapperIter::next_capi(Box* _self) noexcept {
     Box* r = self->it->first;
     ++self->it;
     return r;
+}
+
+void Box::giveAttrDescriptor(const char* attr, Box* (*get)(Box*, void*), void (*set)(Box*, Box*, void*)) {
+    BoxedString* bstr = internStringMortal(attr);
+    giveAttr(bstr, new (pyston_getset_cls) BoxedGetsetDescriptor(bstr, get, set, NULL));
 }
 
 Box* Box::getAttrWrapper() {
@@ -3232,7 +3251,7 @@ static Box* typeName(Box* b, void*) {
 }
 
 static void typeSetName(Box* b, Box* v, void*) {
-    assert(b->cls == type_cls);
+    assert(PyType_Check(b));
     BoxedClass* type = static_cast<BoxedClass*>(b);
 
     // Awkward... in CPython you can only set __name__ for heaptype classes
@@ -3568,6 +3587,9 @@ static Box* getsetGet(Box* self, Box* obj, Box* type) {
         return self;
 
     BoxedGetsetDescriptor* getset_descr = static_cast<BoxedGetsetDescriptor*>(self);
+
+    assert(getset_descr->get != NULL);
+
     if (isSubclass(self->cls, pyston_getset_cls)) {
         return getset_descr->get(obj, getset_descr->closure);
     } else {
@@ -3583,6 +3605,12 @@ static Box* getsetSet(Box* self, Box* obj, Box* val) {
     assert(obj != NULL && obj != None);
 
     BoxedGetsetDescriptor* getset_descr = static_cast<BoxedGetsetDescriptor*>(self);
+
+    if (getset_descr->set == NULL) {
+        raiseExcHelper(AttributeError, "attribute '%s' of '%s' objects is not writable", getset_descr->name->data(),
+                       obj->cls->tp_name);
+    }
+
     if (isSubclass(self->cls, pyston_getset_cls)) {
         getset_descr->set(obj, val, getset_descr->closure);
         return None;
@@ -3595,18 +3623,7 @@ static Box* getsetSet(Box* self, Box* obj, Box* val) {
 }
 
 static Box* getsetDelete(Box* self, Box* obj) {
-    assert(obj != NULL && obj != None);
-
-    BoxedGetsetDescriptor* getset_descr = static_cast<BoxedGetsetDescriptor*>(self);
-    if (isSubclass(self->cls, pyston_getset_cls)) {
-        getset_descr->set(obj, NULL, getset_descr->closure);
-        return None;
-    } else {
-        RELEASE_ASSERT(isSubclass(self->cls, capi_getset_cls), "");
-        getset_descr->set(obj, NULL, getset_descr->closure);
-        checkAndThrowCAPIException();
-        return None;
-    }
+    return getsetSet(self, obj, NULL);
 }
 
 bool TRACK_ALLOCATIONS = false;
@@ -3678,8 +3695,8 @@ void setupRuntime() {
     gc::registerPermanentRoot(EmptyTuple);
     list_cls = new (0) BoxedClass(object_cls, &BoxedList::gcHandler, 0, 0, sizeof(BoxedList), false, "list");
     list_cls->tp_flags |= Py_TPFLAGS_LIST_SUBCLASS;
-    pyston_getset_cls = new (0)
-        BoxedClass(object_cls, NULL, 0, 0, sizeof(BoxedGetsetDescriptor), false, "getset_descriptor");
+    pyston_getset_cls = new (0) BoxedClass(object_cls, &BoxedGetsetDescriptor::gcHandler, 0, 0,
+                                           sizeof(BoxedGetsetDescriptor), false, "getset_descriptor");
     attrwrapper_cls = new (0)
         BoxedClass(object_cls, &AttrWrapper::gcHandler, 0, 0, sizeof(AttrWrapper), false, "attrwrapper");
     dict_cls = new (0) BoxedClass(object_cls, &BoxedDict::gcHandler, 0, 0, sizeof(BoxedDict), false, "dict");
@@ -3808,9 +3825,10 @@ void setupRuntime() {
 
     str_cls->tp_flags |= Py_TPFLAGS_HAVE_NEWBUFFER;
 
-    dict_descr = new (pyston_getset_cls) BoxedGetsetDescriptor(typeSubDict, typeSubSetDict, NULL);
+    dict_descr = new (pyston_getset_cls)
+        BoxedGetsetDescriptor(internStringMortal("__dict__"), typeSubDict, typeSubSetDict, NULL);
     gc::registerPermanentRoot(dict_descr);
-    type_cls->giveAttr("__dict__", new (pyston_getset_cls) BoxedGetsetDescriptor(typeDict, NULL, NULL));
+    type_cls->giveAttrDescriptor("__dict__", typeDict, NULL);
 
 
     instancemethod_cls = BoxedClass::create(type_cls, object_cls, &BoxedInstanceMethod::gcHandler, 0,
@@ -3823,8 +3841,8 @@ void setupRuntime() {
                                  sizeof(BoxedSet), false, "set");
     frozenset_cls = BoxedClass::create(type_cls, object_cls, &BoxedSet::gcHandler, 0, offsetof(BoxedSet, weakreflist),
                                        sizeof(BoxedSet), false, "frozenset");
-    capi_getset_cls
-        = BoxedClass::create(type_cls, object_cls, NULL, 0, 0, sizeof(BoxedGetsetDescriptor), false, "getset");
+    capi_getset_cls = BoxedClass::create(type_cls, object_cls, &BoxedGetsetDescriptor::gcHandler, 0, 0,
+                                         sizeof(BoxedGetsetDescriptor), false, "getset");
     closure_cls = BoxedClass::create(type_cls, object_cls, &BoxedClosure::gcHandler, 0, 0, sizeof(BoxedClosure), false,
                                      "closure");
     property_cls = BoxedClass::create(type_cls, object_cls, &BoxedProperty::gcHandler, 0, 0, sizeof(BoxedProperty),
@@ -3836,8 +3854,10 @@ void setupRuntime() {
     attrwrapperiter_cls = BoxedClass::create(type_cls, object_cls, &AttrWrapperIter::gcHandler, 0, 0,
                                              sizeof(AttrWrapperIter), false, "attrwrapperiter");
 
-    pyston_getset_cls->giveAttr("__get__", new BoxedFunction(FunctionMetadata::create((void*)getsetGet, UNKNOWN, 3)));
-    capi_getset_cls->giveAttr("__get__", new BoxedFunction(FunctionMetadata::create((void*)getsetGet, UNKNOWN, 3)));
+    pyston_getset_cls->giveAttr("__get__",
+                                new BoxedFunction(FunctionMetadata::create((void*)getsetGet, UNKNOWN, 3), { None }));
+    capi_getset_cls->giveAttr("__get__",
+                              new BoxedFunction(FunctionMetadata::create((void*)getsetGet, UNKNOWN, 3), { None }));
     pyston_getset_cls->giveAttr("__set__", new BoxedFunction(FunctionMetadata::create((void*)getsetSet, UNKNOWN, 3)));
     capi_getset_cls->giveAttr("__set__", new BoxedFunction(FunctionMetadata::create((void*)getsetSet, UNKNOWN, 3)));
     pyston_getset_cls->giveAttr("__delete__",
@@ -3865,8 +3885,8 @@ void setupRuntime() {
     auto typeCallObj = FunctionMetadata::create((void*)typeCall, UNKNOWN, 1, true, true);
     typeCallObj->internal_callable.cxx_val = &typeCallInternal;
 
-    type_cls->giveAttr("__name__", new (pyston_getset_cls) BoxedGetsetDescriptor(typeName, typeSetName, NULL));
-    type_cls->giveAttr("__bases__", new (pyston_getset_cls) BoxedGetsetDescriptor(typeBases, typeSetBases, NULL));
+    type_cls->giveAttrDescriptor("__name__", typeName, typeSetName);
+    type_cls->giveAttrDescriptor("__bases__", typeBases, typeSetBases);
     type_cls->giveAttr("__call__", new BoxedFunction(typeCallObj));
 
     type_cls->giveAttr(
@@ -3874,7 +3894,7 @@ void setupRuntime() {
         new BoxedFunction(FunctionMetadata::create((void*)typeNewGeneric, UNKNOWN, 4, false, false), { NULL, NULL }));
     type_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)typeRepr, STR, 1)));
     type_cls->tp_hash = (hashfunc)_Py_HashPointer;
-    type_cls->giveAttr("__module__", new (pyston_getset_cls) BoxedGetsetDescriptor(typeModule, typeSetModule, NULL));
+    type_cls->giveAttrDescriptor("__module__", typeModule, typeSetModule);
     type_cls->giveAttr("__mro__",
                        new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedClass, tp_mro)));
     type_cls->giveAttr("__flags__",
@@ -3893,6 +3913,7 @@ void setupRuntime() {
     none_cls->giveAttr("__nonzero__", new BoxedFunction(FunctionMetadata::create((void*)noneNonzero, BOXED_BOOL, 1)));
     none_cls->giveAttr("__doc__", None);
     none_cls->tp_hash = (hashfunc)_Py_HashPointer;
+    none_cls->tp_new = NULL; // don't allow creating instances
     none_cls->freeze();
     none_cls->tp_repr = none_repr;
 
@@ -3911,7 +3932,7 @@ void setupRuntime() {
     for (auto& md : object_methods) {
         object_cls->giveAttr(md.ml_name, new BoxedMethodDescriptor(&md, object_cls));
     }
-    object_cls->giveAttr("__class__", new (pyston_getset_cls) BoxedGetsetDescriptor(objectClass, objectSetClass, NULL));
+    object_cls->giveAttrDescriptor("__class__", objectClass, objectSetClass);
 
     object_cls->tp_str = object_str;
     add_operators(object_cls);
@@ -3937,6 +3958,7 @@ void setupRuntime() {
     setupClassobj();
     setupSuper();
     _PyUnicode_Init();
+    _PyWarnings_Init();
     _string_init();
     setupDescr();
     setupTraceback();
@@ -3944,25 +3966,23 @@ void setupRuntime() {
     setupFrame();
 
     function_cls->giveAttr("__dict__", dict_descr);
-    function_cls->giveAttr("__name__", new (pyston_getset_cls) BoxedGetsetDescriptor(funcName, funcSetName, NULL));
+    function_cls->giveAttrDescriptor("__name__", funcName, funcSetName);
     function_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)functionRepr, STR, 1)));
     function_cls->giveAttr("__module__", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT,
                                                                    offsetof(BoxedFunction, modname), false));
     function_cls->giveAttr(
         "__doc__", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFunction, doc), false));
     function_cls->giveAttr("func_doc", function_cls->getattr(internStringMortal("__doc__")));
-    function_cls->giveAttr("__globals__", new (pyston_getset_cls) BoxedGetsetDescriptor(functionGlobals, NULL, NULL));
+    function_cls->giveAttrDescriptor("__globals__", functionGlobals, NULL);
     function_cls->giveAttr("__get__", new BoxedFunction(FunctionMetadata::create((void*)functionGet, UNKNOWN, 3)));
     function_cls->giveAttr("__call__",
                            new BoxedFunction(FunctionMetadata::create((void*)functionCall, UNKNOWN, 1, true, true)));
     function_cls->giveAttr("__nonzero__",
                            new BoxedFunction(FunctionMetadata::create((void*)functionNonzero, BOXED_BOOL, 1)));
-    function_cls->giveAttr("func_code",
-                           new (pyston_getset_cls) BoxedGetsetDescriptor(functionCode, functionSetCode, NULL));
+    function_cls->giveAttrDescriptor("func_code", functionCode, functionSetCode);
     function_cls->giveAttr("__code__", function_cls->getattr(internStringMortal("func_code")));
     function_cls->giveAttr("func_name", function_cls->getattr(internStringMortal("__name__")));
-    function_cls->giveAttr("func_defaults",
-                           new (pyston_getset_cls) BoxedGetsetDescriptor(functionDefaults, functionSetDefaults, NULL));
+    function_cls->giveAttrDescriptor("func_defaults", functionDefaults, functionSetDefaults);
     function_cls->giveAttr("__defaults__", function_cls->getattr(internStringMortal("func_defaults")));
     function_cls->giveAttr("func_globals", function_cls->getattr(internStringMortal("__globals__")));
     function_cls->freeze();
@@ -3977,8 +3997,7 @@ void setupRuntime() {
 
     builtin_function_or_method_cls->giveAttr(
         "__repr__", new BoxedFunction(FunctionMetadata::create((void*)builtinFunctionOrMethodRepr, STR, 1)));
-    builtin_function_or_method_cls->giveAttr(
-        "__name__", new (pyston_getset_cls) BoxedGetsetDescriptor(builtinFunctionOrMethodName, NULL, NULL));
+    builtin_function_or_method_cls->giveAttrDescriptor("__name__", builtinFunctionOrMethodName, NULL);
     builtin_function_or_method_cls->giveAttr(
         "__doc__",
         new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedBuiltinFunctionOrMethod, doc), false));
@@ -4041,7 +4060,9 @@ void setupRuntime() {
     attrwrapper_cls->giveAttr("__str__",
                               new BoxedFunction(FunctionMetadata::create((void*)AttrWrapper::str, UNKNOWN, 1)));
     attrwrapper_cls->giveAttr(
-        "__contains__", new BoxedFunction(FunctionMetadata::create((void*)AttrWrapper::contains<CXX>, UNKNOWN, 2)));
+        "__contains__", new BoxedFunction(FunctionMetadata::create((void*)AttrWrapper::contains<CXX>, BOXED_BOOL, 2)));
+    attrwrapper_cls->giveAttr("has_key",
+                              new BoxedFunction(FunctionMetadata::create((void*)AttrWrapper::hasKey, BOXED_BOOL, 2)));
     attrwrapper_cls->giveAttr("__eq__",
                               new BoxedFunction(FunctionMetadata::create((void*)AttrWrapper::eq, UNKNOWN, 2)));
     attrwrapper_cls->giveAttr("__ne__",
@@ -4085,7 +4106,6 @@ void setupRuntime() {
     setupGC();
     setupImport();
     setupPyston();
-    setupAST();
 
     PyType_Ready(&PyByteArrayIter_Type);
     PyType_Ready(&PyCapsule_Type);
@@ -4131,6 +4151,7 @@ void setupRuntime() {
     init_sqlite3();
     PyMarshal_Init();
     initstrop();
+    init_ast();
 
     setupDefaultClassGCParticipation();
 
@@ -4151,21 +4172,24 @@ BoxedModule* createModule(BoxedString* name, const char* fn, const char* doc) {
 
     BoxedDict* d = getSysModulesDict();
 
+    BoxedModule* module = NULL;
+
     // Surprisingly, there are times that we need to return the existing module if
     // one exists:
     Box* existing = d->getOrNull(name);
     if (existing && PyModule_Check(existing)) {
-        return static_cast<BoxedModule*>(existing);
+        module = static_cast<BoxedModule*>(existing);
+    } else {
+        module = new BoxedModule();
+        moduleInit(module, name, boxString(doc ? doc : ""));
+        d->d[name] = module;
     }
 
-    BoxedModule* module = new BoxedModule();
-    moduleInit(module, name, boxString(doc ? doc : ""));
     if (fn)
-        module->giveAttr("__file__", boxString(fn));
+        module->setattr(internStringMortal("__file__"), boxString(fn), NULL);
 
-    d->d[name] = module;
     if (name->s() == "__main__")
-        module->giveAttr("__builtins__", builtins_module);
+        module->setattr(internStringMortal("__builtins__"), builtins_module, NULL);
     return module;
 }
 

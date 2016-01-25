@@ -126,6 +126,10 @@ static Box* traceback_tb_next(Box* self, void*) {
     return traceback->tb_next;
 }
 
+extern "C" int _Py_DisplaySourceLine(PyObject* f, const char* filename, int lineno, int indent) noexcept {
+    RELEASE_ASSERT(0, "Not implemented.");
+}
+
 void setupTraceback() {
     traceback_cls = BoxedClass::create(type_cls, object_cls, BoxedTraceback::gcHandler, 0, 0, sizeof(BoxedTraceback),
                                        false, "traceback");
@@ -140,7 +144,7 @@ void setupTraceback() {
     traceback_cls->giveAttr("tb_lineno", new (pyston_getset_cls) BoxedGetsetDescriptor(traceback_tb_lineno, NULL,
     NULL));
     */
-    traceback_cls->giveAttr("tb_next", new (pyston_getset_cls) BoxedGetsetDescriptor(traceback_tb_next, NULL, NULL));
+    traceback_cls->giveAttrDescriptor("tb_next", traceback_tb_next, NULL);
 
     traceback_cls->freeze();
 }

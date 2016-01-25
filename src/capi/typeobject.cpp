@@ -3402,6 +3402,12 @@ extern "C" void PyType_GiveHcAttrsDictDescr(PyTypeObject* cls) noexcept {
 }
 
 extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
+    // if this type is already in ready state we are finished.
+    if (cls->tp_flags & Py_TPFLAGS_READY) {
+        assert(cls->tp_dict != NULL);
+        return 0;
+    }
+
     ASSERT(!cls->is_pyston_class, "should not call this on Pyston classes");
 
     gc::registerNonheapRootObject(cls, sizeof(PyTypeObject));
@@ -3426,6 +3432,9 @@ extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
     // RELEASE_ASSERT(cls->tp_weaklistoffset == 0, "");
     // RELEASE_ASSERT(cls->tp_traverse == NULL, "");
     // RELEASE_ASSERT(cls->tp_clear == NULL, "");
+
+    // set this flag early because some function check if it is set pretty early
+    cls->is_user_defined = true;
 
     assert(cls->attrs.hcls == NULL);
     new (&cls->attrs) HCAttrs(HiddenClass::makeSingleton());
@@ -3510,7 +3519,6 @@ extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
         cls->gc_visit = &conservativeAndBasesGCHandler;
     else
         cls->gc_visit = &conservativeGCHandler;
-    cls->is_user_defined = true;
 
 
     if (!cls->instancesHaveHCAttrs() && cls->tp_base) {

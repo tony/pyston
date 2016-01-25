@@ -24,7 +24,6 @@ test_al                 No module named al
 test_applesingle        Not really a failure, but it tries to skip itself and we don't support that
 test_argparse           [unknown]
 test_ascii_formatd      segfault in ctypes (but only on CI)
-test_ast                [unknown]
 test_asynchat           [unknown]
 test_asyncore           [unknown]
 test_atexit             [unknown]
@@ -74,14 +73,13 @@ test_ctypes             [unknown]
 test_curses             [unknown]
 test_datetime           needs _PyObject_GetDictPtr
 test_dbm                [unknown]
-test_decimal            I think we need to copy decimaltestdata from cpython
 test_decorators         decorator bug -- we evaluate decorator obj and its args in wrong order
 test_deque              couple unknown issues
 test_descrtut           `exec in DefaultDict()`
 test_descr              wontfix: crashes at "self.__dict__ = self"
 test_dictcomps          we need to disallow assigning to dictcomps
 test_dict               misc failures related to things like gc, abc, comparisons, detecting mutations during iterations
-test_dictviews          various unique bugs
+test_dictviews          segfault calling repr on recursive dictview. remove test/tests/test_dictview.py when the orig test passes
 test_difflib            [unknown]
 test_distutils          [unknown]
 test_dis                [unknown]
@@ -98,7 +96,6 @@ test_extcall            f(**kw) crashes if kw isn't a dict
 test_file2k             we abort when you try to open() a directory
 test_file_eintr         not sure
 test_fileio             [unknown]
-test_file               wontfix: we don't destruct file objects when the test wants
 test_fork1              [unknown]
 test_frozen             [unknown]
 test_ftplib             [unknown]

@@ -85,6 +85,7 @@ file(GLOB_RECURSE STDOBJECT_SRCS Objects
     capsule.c
     cobject.c
     complexobject.c
+    dictobject.c
     dictproxy.c
     exceptions.c
     floatobject.c
@@ -114,6 +115,7 @@ file(GLOB_RECURSE STDPYTHON_SRCS Python
     Python-ast.c
     random.c
     structmember.c
+    _warnings.c
     )
 
 # compile specified files in from_cpython/Python

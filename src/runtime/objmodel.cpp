@@ -2190,9 +2190,14 @@ template <ExceptionStyle S> Box* _getattrEntry(Box* obj, BoxedString* attr, void
                         assert(!rtn);
                         rtn = rewriter->loadConst(0, Location::forArg(1));
                     }
-                    rewriter->call(true, (void*)NoexcHelper::call, rtn, rewriter->getArg(0),
-                                   rewriter->loadConst((intptr_t)attr, Location::forArg(2)));
-                    return_convention = (S == CXX) ? ReturnConvention::HAS_RETURN : ReturnConvention::CAPI_RETURN;
+                    if (S == CXX && return_convention == ReturnConvention::CAPI_RETURN) {
+                        rewriter->checkAndThrowCAPIException(rtn);
+                        return_convention = ReturnConvention::HAS_RETURN;
+                    } else {
+                        rewriter->call(true, (void*)NoexcHelper::call, rtn, rewriter->getArg(0),
+                                       rewriter->loadConst((intptr_t)attr, Location::forArg(2)));
+                        return_convention = (S == CXX) ? ReturnConvention::HAS_RETURN : ReturnConvention::CAPI_RETURN;
+                    }
                 }
             }
 
@@ -2642,7 +2647,7 @@ extern "C" bool nonzero(Box* obj) {
                        || obj->cls == capifunc_cls || obj->cls == builtin_function_or_method_cls
                        || obj->cls == method_cls || obj->cls == frame_cls || obj->cls == generator_cls
                        || obj->cls == capi_getset_cls || obj->cls == pyston_getset_cls || obj->cls == wrapperdescr_cls
-                       || obj->cls == wrapperobject_cls,
+                       || obj->cls == wrapperobject_cls || obj->cls == code_cls,
                    "%s.__nonzero__", getTypeName(obj)); // TODO
 
             if (rewriter.get()) {
@@ -2728,7 +2733,7 @@ int64_t hashUnboxed(Box* obj) {
 
 extern "C" BoxedInt* hash(Box* obj) {
     int64_t r = hashUnboxed(obj);
-    return new BoxedInt(r);
+    return (BoxedInt*)boxInt(r);
 }
 
 template <ExceptionStyle S, Rewritable rewritable>
@@ -4142,6 +4147,10 @@ Box* callCLFunc(FunctionMetadata* md, CallRewriteArgs* rewrite_args, int num_out
         }
     }
 
+    // We check for this assertion later too - by checking it twice, we know
+    // if the error state was set before calling the chosen CF or after.
+    ASSERT(!PyErr_Occurred(), "");
+
     Box* r;
     // we duplicate the call to callChosenCf here so we can
     // distinguish lexically between calls that target jitted python
@@ -4157,6 +4166,11 @@ Box* callCLFunc(FunctionMetadata* md, CallRewriteArgs* rewrite_args, int num_out
     if (!r) {
         assert(S == CAPI);
     } else {
+        // If this assertion is triggered because the type isn't what we expected,
+        // but something that should be allowed (e.g. NotImplementedType), it is
+        // possible that the program has a bad type annotation. For example, an
+        // attribute that we added in C++ should have return type UNKNOWN instead
+        // of BOXED_SOMETHING.
         ASSERT(chosen_cf->spec->rtn_type->isFitBy(r->cls), "%s (%p) was supposed to return %s, but gave a %s",
                g.func_addr_registry.getFuncNameAtAddress(chosen_cf->code, true, NULL).c_str(), chosen_cf->code,
                chosen_cf->spec->rtn_type->debugName().c_str(), r->cls->tp_name);
@@ -5717,6 +5731,8 @@ Box* getiter(Box* o) {
     Box* r = NULL;
     if (PyType_HasFeature(type, Py_TPFLAGS_HAVE_ITER) && type->tp_iter != slot_tp_iter && type->tp_iter) {
         r = type->tp_iter(o);
+        if (!r && PyErr_Occurred())
+            throwCAPIException();
     } else {
         r = type->callIterIC(o);
     }
@@ -5977,13 +5993,23 @@ Box* _typeNew(BoxedClass* metatype, BoxedString* name, BoxedTuple* bases, BoxedD
         made->setattr(dict_str, dict_descr, NULL);
     }
 
+    bool are_all_dict_keys_strs = true;
     for (const auto& p : *attr_dict) {
-        auto k = coerceUnicodeToStr<CXX>(p.first);
-
-        RELEASE_ASSERT(k->cls == str_cls, "%s", k->cls->tp_name);
-        BoxedString* s = static_cast<BoxedString*>(k);
-        internStringMortalInplace(s);
-        made->setattr(s, p.second, NULL);
+        if (p.first->cls != str_cls) {
+            are_all_dict_keys_strs = false;
+            break;
+        }
+    }
+    if (are_all_dict_keys_strs) {
+        for (const auto& p : *attr_dict) {
+            BoxedString* s = static_cast<BoxedString*>(p.first);
+            internStringMortalInplace(s);
+            made->setattr(s, p.second, NULL);
+        }
+    } else {
+        Box* copy = PyDict_Copy(attr_dict);
+        RELEASE_ASSERT(copy, "");
+        made->setDictBacked(copy);
     }
 
     static BoxedString* module_str = internStringImmortal("__module__");

@@ -37,11 +37,14 @@ print type(F2(D(F())))
 
 print type(float(F()))
 
-try:
-    f = float("hello world")
-    print f
-except ValueError as e:
-    print e
+for a in ["hello world", None]:
+    try:
+        f = float(a)
+        print f
+    except ValueError as e:
+        print "ValueError", e
+    except TypeError as e:
+        print "TypeError", e
 
 try:
     f = float("5 hello world")
@@ -111,3 +114,29 @@ print sys.float_info
 
 if 1:
     x = -2.0
+
+print(float.__long__(sys.float_info.max))
+print(float.__int__(sys.float_info.max))
+
+data = ["-1.0", "0.0", "1.0",
+        "5.0", "-5.0",
+        "5", "5L", "0L", "5+5j",
+        "\"5\"", "None",
+        ]
+
+operations = ["__rpow__",
+              "__ridv__",
+              "__divmod__", "__rdivmod__",
+              "__rtruediv__",
+              "__coerce__"
+              ]
+
+for x in data:
+    for y in data:
+        for operation in operations:
+            try:
+                print(eval("float.{op}({arg1}, {arg2})".format(op=operation,
+                                                               arg1=x,
+                                                               arg2=y)))
+            except Exception as e:
+                print(e.message)
